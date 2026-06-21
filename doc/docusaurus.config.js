@@ -12,6 +12,20 @@ const config = {
   trailingSlash: false,
   onBrokenLinks: 'throw',
   onBrokenMarkdownLinks: 'warn',
+  i18n: {
+    defaultLocale: 'en',
+    locales: ['en', 'zh-Hans'],
+    localeConfigs: {
+      en: {
+        label: 'English',
+        htmlLang: 'en-US',
+      },
+      'zh-Hans': {
+        label: '简体中文',
+        htmlLang: 'zh-CN',
+      },
+    },
+  },
   presets: [
     [
       'classic',
@@ -29,6 +43,7 @@ const config = {
       title: `${projectName} Docs`,
       items: [
         {to: '/docs/intro', label: 'Docs', position: 'left'},
+        {type: 'localeDropdown', position: 'right'},
         {href: `https://github.com/${repository}`, label: 'GitHub', position: 'right'},
       ],
     },
