@@ -36,6 +36,8 @@ func Connect(dbPath string) error {
 func Migrate() error {
 	err := DB.AutoMigrate(
 		&models.User{},
+		&models.Project{},
+		&models.AgentSession{},
 		&models.Container{},
 		&models.OperationAudit{},
 	)

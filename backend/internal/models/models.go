@@ -15,6 +15,28 @@ type User struct {
 	Containers   []Container `gorm:"foreignKey:UserID" json:"containers,omitempty"`
 }
 
+type Project struct {
+	ID          string    `gorm:"primaryKey" json:"id"`
+	Name        string    `gorm:"not null" json:"name"`
+	RepoURL     string    `json:"repo_url"`
+	Branch      string    `json:"branch"`
+	Image       string    `json:"image"`
+	NetworkMode string    `json:"network_mode"`
+	Workspace   string    `gorm:"not null" json:"workspace"`
+	ContainerID string    `gorm:"uniqueIndex;not null" json:"container_id"`
+	Status      string    `json:"status"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+type AgentSession struct {
+	ID        uint      `gorm:"primarykey" json:"id"`
+	ProjectID string    `gorm:"not null;index" json:"project_id"`
+	Name      string    `gorm:"not null" json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 type Container struct {
 	ID            uint      `gorm:"primarykey" json:"id"`
 	UserID        uint      `gorm:"not null;index" json:"user_id"`
@@ -55,6 +77,14 @@ func (Container) TableName() string {
 	return "containers"
 }
 
+func (Project) TableName() string {
+	return "projects"
+}
+
+func (AgentSession) TableName() string {
+	return "agent_sessions"
+}
+
 func (OperationAudit) TableName() string {
 	return "operation_audits"
 }
@@ -69,6 +99,20 @@ func (u *User) BeforeCreate(tx *gorm.DB) error {
 func (c *Container) BeforeCreate(tx *gorm.DB) error {
 	c.CreatedAt = time.Now()
 	c.UpdatedAt = time.Now()
+	return nil
+}
+
+func (p *Project) BeforeCreate(tx *gorm.DB) error {
+	now := time.Now()
+	p.CreatedAt = now
+	p.UpdatedAt = now
+	return nil
+}
+
+func (s *AgentSession) BeforeCreate(tx *gorm.DB) error {
+	now := time.Now()
+	s.CreatedAt = now
+	s.UpdatedAt = now
 	return nil
 }
 
