@@ -17,6 +17,7 @@
 *.db
 *.db-shm
 *.db-wal
+.dobox-e2e/
 
 # Environment
 .env

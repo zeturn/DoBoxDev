@@ -78,12 +78,14 @@ func toNetworkPortMap(ports map[string]string) (networkapi.PortSet, networkapi.P
 }
 
 func (s *DockerService) CreateContainer(ctx context.Context, opts CreateContainerOptions) (string, error) {
-	pullResp, err := s.client.ImagePull(ctx, opts.Image, client.ImagePullOptions{})
-	if err != nil {
-		return "", fmt.Errorf("failed to pull image %s: %w", opts.Image, err)
+	if _, err := s.client.ImageInspect(ctx, opts.Image); err != nil {
+		pullResp, err := s.client.ImagePull(ctx, opts.Image, client.ImagePullOptions{})
+		if err != nil {
+			return "", fmt.Errorf("failed to pull image %s: %w", opts.Image, err)
+		}
+		_, _ = io.Copy(io.Discard, pullResp)
+		_ = pullResp.Close()
 	}
-	_, _ = io.Copy(io.Discard, pullResp)
-	_ = pullResp.Close()
 
 	exposedPorts, portBindings := toNetworkPortMap(opts.Ports)
 
