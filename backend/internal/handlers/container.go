@@ -548,24 +548,36 @@ func (h *ContainerHandler) UploadFile(c *fiber.Ctx) error {
 }
 
 func firstFileFromTar(content []byte) (string, []byte, error) {
-	tr := tar.NewReader(bytes.NewReader(content))
+	name, b, _, err := firstFileFromTarReaderLimited(bytes.NewReader(content), int64(len(content)))
+	return name, b, err
+}
+
+func firstFileFromTarReaderLimited(reader io.Reader, limitBytes int64) (string, []byte, bool, error) {
+	if limitBytes <= 0 {
+		limitBytes = 1
+	}
+	tr := tar.NewReader(reader)
 	for {
 		h, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return "", nil, err
+			return "", nil, false, err
 		}
 		if h.Typeflag == tar.TypeReg {
-			b, err := io.ReadAll(tr)
+			b, err := io.ReadAll(io.LimitReader(tr, limitBytes+1))
 			if err != nil {
-				return "", nil, err
+				return "", nil, false, err
 			}
-			return h.Name, b, nil
+			truncated := int64(len(b)) > limitBytes
+			if truncated {
+				b = b[:limitBytes]
+			}
+			return h.Name, b, truncated, nil
 		}
 	}
-	return "", nil, io.EOF
+	return "", nil, false, io.EOF
 }
 
 func (h *ContainerHandler) DownloadFile(c *fiber.Ctx) error {

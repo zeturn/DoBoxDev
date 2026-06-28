@@ -22,6 +22,14 @@ import (
 	"github.com/moby/moby/client"
 )
 
+const (
+	DefaultExecOutputLimitBytes = int64(1_000_000)
+	DefaultSandboxUID           = 10001
+	DefaultSandboxGID           = 10001
+	DefaultSandboxUser          = "10001:10001"
+	defaultSandboxPidsLimit     = int64(512)
+)
+
 type DockerService struct {
 	client *client.Client
 }
@@ -52,6 +60,18 @@ type CreateContainerOptions struct {
 	MemoryLimit   int64
 }
 
+type CreateSandboxOptions struct {
+	Name          string
+	Image         string
+	VolumeName    string
+	NetworkName   string
+	WorkspacePath string
+	User          string
+	CPULimit      float64
+	MemoryLimit   int64
+	PidsLimit     int64
+}
+
 func toNetworkPortMap(ports map[string]string) (networkapi.PortSet, networkapi.PortMap) {
 	exposed := networkapi.PortSet{}
 	bindings := networkapi.PortMap{}
@@ -77,14 +97,23 @@ func toNetworkPortMap(ports map[string]string) (networkapi.PortSet, networkapi.P
 	return exposed, bindings
 }
 
+func (s *DockerService) ensureImageAvailable(ctx context.Context, image string) error {
+	if _, err := s.client.ImageInspect(ctx, image); err == nil {
+		return nil
+	}
+
+	pullResp, err := s.client.ImagePull(ctx, image, client.ImagePullOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to pull image %s: %w", image, err)
+	}
+	_, _ = io.Copy(io.Discard, pullResp)
+	_ = pullResp.Close()
+	return nil
+}
+
 func (s *DockerService) CreateContainer(ctx context.Context, opts CreateContainerOptions) (string, error) {
-	if _, err := s.client.ImageInspect(ctx, opts.Image); err != nil {
-		pullResp, err := s.client.ImagePull(ctx, opts.Image, client.ImagePullOptions{})
-		if err != nil {
-			return "", fmt.Errorf("failed to pull image %s: %w", opts.Image, err)
-		}
-		_, _ = io.Copy(io.Discard, pullResp)
-		_ = pullResp.Close()
+	if err := s.ensureImageAvailable(ctx, opts.Image); err != nil {
+		return "", err
 	}
 
 	exposedPorts, portBindings := toNetworkPortMap(opts.Ports)
@@ -129,6 +158,85 @@ func (s *DockerService) CreateContainer(ctx context.Context, opts CreateContaine
 		return "", fmt.Errorf("failed to create container: %w", err)
 	}
 	return result.ID, nil
+}
+
+func (s *DockerService) CreateSandboxContainer(ctx context.Context, opts CreateSandboxOptions) (string, error) {
+	createOpts, err := sandboxContainerCreateOptions(opts)
+	if err != nil {
+		return "", err
+	}
+
+	if err := s.ensureImageAvailable(ctx, createOpts.Config.Image); err != nil {
+		return "", err
+	}
+
+	result, err := s.client.ContainerCreate(ctx, createOpts)
+	if err != nil {
+		return "", fmt.Errorf("failed to create sandbox container: %w", err)
+	}
+	return result.ID, nil
+}
+
+func sandboxContainerCreateOptions(opts CreateSandboxOptions) (client.ContainerCreateOptions, error) {
+	name := strings.TrimSpace(opts.Name)
+	if name == "" {
+		return client.ContainerCreateOptions{}, fmt.Errorf("sandbox name is required")
+	}
+	image := strings.TrimSpace(opts.Image)
+	if image == "" {
+		return client.ContainerCreateOptions{}, fmt.Errorf("sandbox image is required")
+	}
+	volumeName := strings.TrimSpace(opts.VolumeName)
+	if volumeName == "" {
+		return client.ContainerCreateOptions{}, fmt.Errorf("sandbox volume name is required")
+	}
+	networkName := strings.TrimSpace(opts.NetworkName)
+	if networkName == "" {
+		return client.ContainerCreateOptions{}, fmt.Errorf("sandbox network name is required")
+	}
+	workspacePath := strings.TrimSpace(opts.WorkspacePath)
+	if workspacePath == "" {
+		workspacePath = "/workspace"
+	}
+	sandboxUser := strings.TrimSpace(opts.User)
+	if sandboxUser == "" {
+		sandboxUser = DefaultSandboxUser
+	}
+	pidsLimit := opts.PidsLimit
+	if pidsLimit <= 0 {
+		pidsLimit = defaultSandboxPidsLimit
+	}
+
+	resources := containerapi.Resources{}
+	if opts.CPULimit > 0 {
+		resources.NanoCPUs = int64(opts.CPULimit * 1e9)
+	}
+	if opts.MemoryLimit > 0 {
+		resources.Memory = opts.MemoryLimit
+	}
+	resources.PidsLimit = &pidsLimit
+
+	return client.ContainerCreateOptions{
+		Name: name,
+		Config: &containerapi.Config{
+			Image:      image,
+			User:       sandboxUser,
+			Env:        []string{"HOME=/home/docode"},
+			WorkingDir: workspacePath,
+		},
+		HostConfig: &containerapi.HostConfig{
+			Binds:          []string{fmt.Sprintf("%s:%s", volumeName, workspacePath)},
+			NetworkMode:    containerapi.NetworkMode(networkName),
+			Resources:      resources,
+			AutoRemove:     false,
+			ReadonlyRootfs: false,
+			CapDrop:        []string{"ALL"},
+			SecurityOpt:    []string{"no-new-privileges:true"},
+			RestartPolicy: containerapi.RestartPolicy{
+				Name: containerapi.RestartPolicyUnlessStopped,
+			},
+		},
+	}, nil
 }
 
 func (s *DockerService) StartContainer(ctx context.Context, containerID string) error {
@@ -345,8 +453,16 @@ func (s *DockerService) StreamContainerLogs(ctx context.Context, containerID str
 }
 
 func (s *DockerService) ExecInContainer(ctx context.Context, containerID string, cmd []string, workDir string, env []string) (string, int, error) {
+	output, exitCode, _, err := s.ExecInContainerLimited(ctx, containerID, cmd, workDir, env, DefaultExecOutputLimitBytes)
+	return output, exitCode, err
+}
+
+func (s *DockerService) ExecInContainerLimited(ctx context.Context, containerID string, cmd []string, workDir string, env []string, outputLimitBytes int64) (string, int, bool, error) {
 	if len(cmd) == 0 {
-		return "", 0, fmt.Errorf("exec command is required")
+		return "", 0, false, fmt.Errorf("exec command is required")
+	}
+	if outputLimitBytes <= 0 || outputLimitBytes > DefaultExecOutputLimitBytes {
+		outputLimitBytes = DefaultExecOutputLimitBytes
 	}
 	createRes, err := s.client.ExecCreate(ctx, containerID, client.ExecCreateOptions{
 		AttachStdout: true,
@@ -357,27 +473,38 @@ func (s *DockerService) ExecInContainer(ctx context.Context, containerID string,
 		Env:          env,
 	})
 	if err != nil {
-		return "", 0, err
+		return "", 0, false, err
 	}
 	startRes, err := s.client.ExecAttach(ctx, createRes.ID, client.ExecAttachOptions{
 		TTY: true,
 	})
 	if err != nil {
-		return "", 0, err
+		return "", 0, false, err
 	}
 	defer startRes.Close()
-	if _, err := s.client.ExecStart(ctx, createRes.ID, client.ExecStartOptions{TTY: true}); err != nil {
-		return "", 0, err
-	}
-	out, err := io.ReadAll(startRes.Reader)
+	out, truncated, err := readLimited(startRes.Reader, outputLimitBytes)
 	if err != nil {
-		return "", 0, err
+		return "", 0, truncated, err
 	}
 	inspect, err := s.client.ExecInspect(ctx, createRes.ID, client.ExecInspectOptions{})
 	if err != nil {
-		return "", 0, err
+		return "", 0, truncated, err
 	}
-	return string(out), inspect.ExitCode, nil
+	return string(out), inspect.ExitCode, truncated, nil
+}
+
+func readLimited(reader io.Reader, limitBytes int64) ([]byte, bool, error) {
+	if limitBytes <= 0 {
+		limitBytes = DefaultExecOutputLimitBytes
+	}
+	out, err := io.ReadAll(io.LimitReader(reader, limitBytes+1))
+	if err != nil {
+		return out, false, err
+	}
+	if int64(len(out)) <= limitBytes {
+		return out, false, nil
+	}
+	return out[:limitBytes], true, nil
 }
 
 func (s *DockerService) OpenContainerShell(ctx context.Context, containerID string, cmd []string) (client.ExecAttachResult, string, error) {
@@ -423,7 +550,7 @@ func (s *DockerService) GetContainerHealthAndExit(ctx context.Context, container
 	return health, exitCode, nil
 }
 
-func tarSingleFile(name string, data []byte, mode fs.FileMode) (io.Reader, error) {
+func tarSandboxFile(name string, data []byte, mode fs.FileMode) (io.Reader, error) {
 	buf := &bytes.Buffer{}
 	tw := tar.NewWriter(buf)
 	h := &tar.Header{
@@ -431,6 +558,10 @@ func tarSingleFile(name string, data []byte, mode fs.FileMode) (io.Reader, error
 		Mode:    int64(mode.Perm()),
 		Size:    int64(len(data)),
 		ModTime: time.Now(),
+		Uid:     DefaultSandboxUID,
+		Gid:     DefaultSandboxGID,
+		Uname:   "docode",
+		Gname:   "docode",
 	}
 	if err := tw.WriteHeader(h); err != nil {
 		return nil, err
@@ -445,7 +576,7 @@ func tarSingleFile(name string, data []byte, mode fs.FileMode) (io.Reader, error
 }
 
 func (s *DockerService) UploadFileToContainer(ctx context.Context, containerID, destinationPath, fileName string, data []byte) error {
-	tarReader, err := tarSingleFile(fileName, data, 0o644)
+	tarReader, err := tarSandboxFile(fileName, data, 0o644)
 	if err != nil {
 		return err
 	}
