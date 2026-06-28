@@ -19,7 +19,7 @@ RUN CGO_ENABLED=1 GOOS=linux go build -o server cmd/server/main.go
 # Runtime stage
 FROM alpine:latest
 
-RUN apk --no-cache add ca-certificates sqlite-libs
+RUN apk --no-cache add ca-certificates git sqlite-libs
 
 WORKDIR /root/
 

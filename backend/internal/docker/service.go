@@ -366,6 +366,9 @@ func (s *DockerService) ExecInContainer(ctx context.Context, containerID string,
 		return "", 0, err
 	}
 	defer startRes.Close()
+	if _, err := s.client.ExecStart(ctx, createRes.ID, client.ExecStartOptions{TTY: true}); err != nil {
+		return "", 0, err
+	}
 	out, err := io.ReadAll(startRes.Reader)
 	if err != nil {
 		return "", 0, err
