@@ -1,662 +1,1095 @@
 package handlers
 
 import (
-	"archive/tar"
-	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
+	"docode/internal/database"
+	"docode/internal/docker"
+	"docode/internal/middleware"
+	"docode/internal/models"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"io"
-	"io/fs"
-	"os"
-	"os/exec"
-	"path/filepath"
+	"path"
+	"strconv"
 	"strings"
 	"time"
 
-	"docode/internal/database"
-	"docode/internal/docker"
-	"docode/internal/models"
-
 	"github.com/gofiber/fiber/v2"
+	"gorm.io/gorm"
 )
 
 const (
-	defaultProjectImage = "dobox/code-sandbox:latest"
-	workspaceMountPath  = "/workspace"
+	defaultSandboxImage          = "dobox/code-sandbox:latest"
+	defaultWorkspacePath         = "/workspace"
+	defaultCPULimit              = 2.0
+	defaultMemoryLimit           = int64(2 * 1024 * 1024 * 1024)
+	defaultPidsLimit             = int64(512)
+	defaultCommandTimeoutSeconds = 120
+	maxCommandTimeoutSeconds     = 300
+	defaultOutputLimitBytes      = int64(1_000_000)
 )
 
 type ProjectHandler struct {
 	dockerService *docker.DockerService
-	dataDir       string
 }
 
-func NewProjectHandler(dockerService *docker.DockerService, dataDir string) *ProjectHandler {
-	if strings.TrimSpace(dataDir) == "" {
-		dataDir = "./data"
-	}
-	return &ProjectHandler{dockerService: dockerService, dataDir: dataDir}
+func NewProjectHandler(dockerService *docker.DockerService) *ProjectHandler {
+	return &ProjectHandler{dockerService: dockerService}
 }
 
 type CreateProjectRequest struct {
-	Name        string `json:"name"`
-	RepoURL     string `json:"repo_url"`
-	Branch      string `json:"branch"`
-	Image       string `json:"image"`
-	NetworkMode string `json:"network_mode"`
+	Name        string  `json:"name"`
+	RepoURL     string  `json:"repo_url"`
+	Branch      string  `json:"branch"`
+	Image       string  `json:"image"`
+	Workspace   string  `json:"workspace"`
+	NetworkMode string  `json:"network_mode"`
+	CPULimit    float64 `json:"cpu_limit"`
+	MemoryLimit int64   `json:"memory_limit"`
 }
 
-type CreateAgentSessionRequest struct {
-	Name string `json:"name"`
+type ProjectResponse struct {
+	Project PublicProject `json:"project"`
+	Sandbox PublicSandbox `json:"sandbox"`
 }
 
-type ExecProjectRequest struct {
-	Command        any    `json:"command"`
-	WorkingDir     string `json:"working_dir"`
-	TimeoutSec     int    `json:"timeout_sec"`
-	OutputLimit    int    `json:"output_limit"`
-	AgentSessionID *uint  `json:"agent_session_id"`
+type PublicProject struct {
+	ID        uint      `json:"id"`
+	UserID    uint      `json:"user_id"`
+	Name      string    `json:"name"`
+	RepoURL   string    `json:"repo_url"`
+	Branch    string    `json:"branch"`
+	Workspace string    `json:"workspace"`
+	SandboxID uint      `json:"sandbox_id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
-type FilePathRequest struct {
-	Path           string `json:"path"`
-	AgentSessionID *uint  `json:"agent_session_id"`
+type PublicSandbox struct {
+	ID            uint      `json:"id"`
+	UserID        uint      `json:"user_id"`
+	ProjectID     uint      `json:"project_id"`
+	Name          string    `json:"name"`
+	Image         string    `json:"image"`
+	Status        string    `json:"status"`
+	WorkspacePath string    `json:"workspace_path"`
+	CPULimit      float64   `json:"cpu_limit"`
+	MemoryLimit   int64     `json:"memory_limit"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
-type FileWriteRequest struct {
-	Path           string `json:"path"`
-	Content        string `json:"content"`
-	AgentSessionID *uint  `json:"agent_session_id"`
+func (h *ProjectHandler) ListProjects(c *fiber.Ctx) error {
+	userID := middleware.GetUserID(c)
+
+	var projects []models.Project
+	if err := database.DB.Preload("Sandbox").Where("user_id = ?", userID).Find(&projects).Error; err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch projects"})
+	}
+
+	for i := range projects {
+		if projects[i].Sandbox == nil || projects[i].Sandbox.ContainerID == "" {
+			continue
+		}
+		if status, err := h.dockerService.GetContainerStatus(context.Background(), projects[i].Sandbox.ContainerID); err == nil {
+			projects[i].Sandbox.Status = status
+			_ = database.DB.Model(projects[i].Sandbox).Update("status", status).Error
+		}
+	}
+
+	responses := make([]ProjectResponse, 0, len(projects))
+	for i := range projects {
+		if projects[i].Sandbox == nil {
+			continue
+		}
+		responses = append(responses, publicProjectResponse(&projects[i], projects[i].Sandbox))
+	}
+
+	return c.JSON(responses)
 }
 
-type SearchRequest struct {
-	Query          string `json:"query"`
-	Path           string `json:"path"`
-	AgentSessionID *uint  `json:"agent_session_id"`
-}
+func (h *ProjectHandler) GetProject(c *fiber.Ctx) error {
+	userID := middleware.GetUserID(c)
+	projectID := c.Params("projectId")
 
-type CommitRequest struct {
-	Message        string `json:"message"`
-	AgentSessionID *uint  `json:"agent_session_id"`
+	project, sandbox, err := h.getOwnedProjectSandbox(userID, projectID)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Project not found"})
+	}
+	if status, err := h.dockerService.GetContainerStatus(context.Background(), sandbox.ContainerID); err == nil {
+		sandbox.Status = status
+		_ = database.DB.Model(sandbox).Update("status", status).Error
+	}
+	return c.JSON(publicProjectResponse(project, sandbox))
 }
 
 func (h *ProjectHandler) CreateProject(c *fiber.Ctx) error {
+	userID := middleware.GetUserID(c)
+
 	var req CreateProjectRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
 	}
-	if strings.TrimSpace(req.Name) == "" {
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "name is required"})
 	}
 
-	projectID := randomID(12)
-	image := strings.TrimSpace(req.Image)
-	if image == "" {
-		image = defaultProjectImage
-	}
-	networkMode, err := projectNetworkMode(req.NetworkMode)
+	workspace, err := sandboxWorkspace(req.Workspace)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
-	workspace := filepath.Join(h.dataDir, "projects", projectID, "workspace")
-	if err := os.MkdirAll(workspace, 0o755); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
-	}
-	if err := h.prepareWorkspace(workspace, req.RepoURL, req.Branch); err != nil {
+	image, err := sandboxImage(req.Image)
+	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	networkInternal, err := sandboxNetworkInternal(req.NetworkMode)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	cpuLimit := sandboxCPULimit(req.CPULimit)
+	memoryLimit := sandboxMemoryLimit(req.MemoryLimit)
+
+	project := models.Project{
+		UserID:    userID,
+		Name:      req.Name,
+		RepoURL:   strings.TrimSpace(req.RepoURL),
+		Branch:    strings.TrimSpace(req.Branch),
+		Workspace: workspace,
+	}
+	if err := database.DB.Create(&project).Error; err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create project"})
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	containerID, err := h.dockerService.CreateContainer(ctx, docker.CreateContainerOptions{
-		Name:          "dobox-project-" + projectID,
+
+	volumeName := fmt.Sprintf("dobox_project_%d", project.ID)
+	networkName := fmt.Sprintf("dobox_project_%d", project.ID)
+	containerName := fmt.Sprintf("dobox-p%d-sandbox", project.ID)
+
+	createdContainerID := ""
+	createdNetwork := false
+	createdVolume := false
+	cleanup := func() {
+		if createdContainerID != "" {
+			_ = h.dockerService.RemoveContainer(context.Background(), createdContainerID)
+		}
+		if createdNetwork {
+			_ = h.dockerService.RemoveNetwork(context.Background(), networkName)
+		}
+		if createdVolume {
+			_ = h.dockerService.RemoveVolume(context.Background(), volumeName, true)
+		}
+		_ = database.DB.Where("project_id = ?", project.ID).Delete(&models.ToolCall{}).Error
+		_ = database.DB.Where("project_id = ?", project.ID).Delete(&models.AgentSession{}).Error
+		_ = database.DB.Where("project_id = ?", project.ID).Delete(&models.Sandbox{}).Error
+		_ = database.DB.Delete(&project).Error
+	}
+
+	if _, err := h.dockerService.CreateVolume(ctx, volumeName, "local", map[string]string{
+		"dobox.project_id": strconv.FormatUint(uint64(project.ID), 10),
+		"dobox.user_id":    strconv.FormatUint(uint64(userID), 10),
+	}); err != nil {
+		cleanup()
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create project volume: " + err.Error()})
+	}
+	createdVolume = true
+
+	if _, err := h.dockerService.CreateNetwork(ctx, networkName, "bridge", false, networkInternal); err != nil {
+		cleanup()
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create project network: " + err.Error()})
+	}
+	createdNetwork = true
+
+	containerID, err := h.dockerService.CreateSandboxContainer(ctx, docker.CreateSandboxOptions{
+		Name:          containerName,
 		Image:         image,
-		Volumes:       []string{hostVolume(workspace) + ":" + workspaceMountPath},
-		Command:       []string{"sh", "-lc", "while true; do sleep 3600; done"},
-		WorkingDir:    workspaceMountPath,
-		RestartPolicy: "no",
-		NetworkMode:   networkMode,
-		CPULimit:      2,
-		MemoryLimit:   2 * 1024 * 1024 * 1024,
+		VolumeName:    volumeName,
+		NetworkName:   networkName,
+		WorkspacePath: workspace,
+		User:          docker.DefaultSandboxUser,
+		CPULimit:      cpuLimit,
+		MemoryLimit:   memoryLimit,
+		PidsLimit:     defaultPidsLimit,
 	})
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create sandbox: " + err.Error()})
+		cleanup()
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create project sandbox: " + err.Error()})
 	}
+	createdContainerID = containerID
+
 	if err := h.dockerService.StartContainer(ctx, containerID); err != nil {
-		_ = h.dockerService.RemoveContainer(context.Background(), containerID)
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to start sandbox: " + err.Error()})
+		cleanup()
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to start project sandbox: " + err.Error()})
 	}
 
-	project := models.Project{
-		ID:          projectID,
-		Name:        req.Name,
-		RepoURL:     req.RepoURL,
-		Branch:      req.Branch,
-		Image:       image,
-		NetworkMode: networkMode,
-		Workspace:   workspace,
-		ContainerID: containerID,
-		Status:      "running",
+	sandbox := models.Sandbox{
+		UserID:        userID,
+		ProjectID:     project.ID,
+		ContainerID:   containerID,
+		Name:          containerName,
+		Image:         image,
+		Status:        "running",
+		WorkspacePath: workspace,
+		VolumeName:    volumeName,
+		NetworkName:   networkName,
+		CPULimit:      cpuLimit,
+		MemoryLimit:   memoryLimit,
 	}
-	if err := database.DB.Create(&project).Error; err != nil {
-		_ = h.dockerService.RemoveContainer(context.Background(), containerID)
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to persist project: " + err.Error()})
+	if err := database.DB.Create(&sandbox).Error; err != nil {
+		cleanup()
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to save project sandbox"})
 	}
-	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
-		"project": project,
-		"sandbox": fiber.Map{"id": containerID},
-	})
-}
+	project.SandboxID = sandbox.ID
+	if err := database.DB.Save(&project).Error; err != nil {
+		cleanup()
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to link project sandbox"})
+	}
 
-func (h *ProjectHandler) GetProject(c *fiber.Ctx) error {
-	project, err := h.getProject(c.Params("id"))
-	if err != nil {
-		return notFound(c, "project not found")
+	if project.RepoURL != "" {
+		if output, exitCode, err := h.cloneRepo(ctx, sandbox, project.RepoURL, project.Branch); err != nil || exitCode != 0 {
+			cleanup()
+			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to clone repository: " + err.Error()})
+			}
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to clone repository", "output": output, "exit_code": exitCode})
+		}
 	}
-	if status, err := h.dockerService.GetContainerStatus(context.Background(), project.ContainerID); err == nil {
-		project.Status = status
-		_ = database.DB.Save(project).Error
-	}
-	return c.JSON(project)
+
+	return c.Status(fiber.StatusCreated).JSON(publicProjectResponse(&project, &sandbox))
 }
 
 func (h *ProjectHandler) DeleteProject(c *fiber.Ctx) error {
-	project, err := h.getProject(c.Params("id"))
+	userID := middleware.GetUserID(c)
+	projectID := c.Params("projectId")
+
+	project, sandbox, err := h.getOwnedProjectSandbox(userID, projectID)
 	if err != nil {
-		return notFound(c, "project not found")
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Project not found"})
 	}
-	_ = h.dockerService.RemoveContainer(context.Background(), project.ContainerID)
-	_ = os.RemoveAll(filepath.Dir(project.Workspace))
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if sandbox.ContainerID != "" {
+		_ = h.dockerService.RemoveContainer(ctx, sandbox.ContainerID)
+	}
+	if sandbox.NetworkName != "" {
+		_ = h.dockerService.RemoveNetwork(ctx, sandbox.NetworkName)
+	}
+	if sandbox.VolumeName != "" {
+		_ = h.dockerService.RemoveVolume(ctx, sandbox.VolumeName, true)
+	}
+	_ = database.DB.Where("project_id = ?", project.ID).Delete(&models.ToolCall{}).Error
 	_ = database.DB.Where("project_id = ?", project.ID).Delete(&models.AgentSession{}).Error
+	_ = database.DB.Delete(sandbox).Error
 	_ = database.DB.Delete(project).Error
-	return c.JSON(fiber.Map{"message": "Project deleted"})
+
+	return c.JSON(fiber.Map{"message": "Project deleted successfully"})
 }
 
 func (h *ProjectHandler) CreateAgentSession(c *fiber.Ctx) error {
-	project, err := h.getProject(c.Params("id"))
+	userID := middleware.GetUserID(c)
+	projectID := c.Params("projectId")
+
+	project, _, err := h.getOwnedProjectSandbox(userID, projectID)
 	if err != nil {
-		return notFound(c, "project not found")
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Project not found"})
 	}
-	var req CreateAgentSessionRequest
+
+	var req struct {
+		Name string `json:"name"`
+	}
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
 	}
-	if strings.TrimSpace(req.Name) == "" {
-		req.Name = "agent"
+
+	session := models.AgentSession{
+		UserID:    userID,
+		ProjectID: project.ID,
+		Name:      strings.TrimSpace(req.Name),
+		Status:    "active",
 	}
-	session := models.AgentSession{ProjectID: project.ID, Name: req.Name}
 	if err := database.DB.Create(&session).Error; err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create agent session"})
 	}
 	return c.Status(fiber.StatusCreated).JSON(session)
 }
 
-func (h *ProjectHandler) Exec(c *fiber.Ctx) error {
-	project, err := h.getProject(c.Params("id"))
+func (h *ProjectHandler) ListAgentSessions(c *fiber.Ctx) error {
+	userID := middleware.GetUserID(c)
+	projectID := c.Params("projectId")
+
+	project, _, err := h.getOwnedProjectSandbox(userID, projectID)
 	if err != nil {
-		return notFound(c, "project not found")
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Project not found"})
 	}
-	var req ExecProjectRequest
+
+	var sessions []models.AgentSession
+	if err := database.DB.Where("user_id = ? AND project_id = ?", userID, project.ID).Order("created_at DESC").Find(&sessions).Error; err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch agent sessions"})
+	}
+	return c.JSON(sessions)
+}
+
+func (h *ProjectHandler) ListToolCalls(c *fiber.Ctx) error {
+	userID := middleware.GetUserID(c)
+	projectID := c.Params("projectId")
+
+	project, _, err := h.getOwnedProjectSandbox(userID, projectID)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Project not found"})
+	}
+
+	query := database.DB.Where("user_id = ? AND project_id = ?", userID, project.ID)
+	sessionID, ok := h.toolSessionFromQuery(c, userID, project.ID)
+	if !ok {
+		return nil
+	}
+	if sessionID > 0 {
+		query = query.Where("agent_session_id = ?", sessionID)
+	}
+
+	var calls []models.ToolCall
+	if err := query.Order("created_at DESC").Limit(auditListLimit(c.Query("limit"))).Find(&calls).Error; err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch tool calls"})
+	}
+	return c.JSON(calls)
+}
+
+func (h *ProjectHandler) RunCommand(c *fiber.Ctx) error {
+	userID := middleware.GetUserID(c)
+	project, sandbox, ok := h.loadToolSandbox(c, userID)
+	if !ok {
+		return nil
+	}
+
+	var req struct {
+		Command        json.RawMessage `json:"command"`
+		CWD            string          `json:"cwd"`
+		WorkingDir     string          `json:"working_dir"`
+		Env            []string        `json:"env"`
+		TimeoutSec     int             `json:"timeout_sec"`
+		OutputLimit    int64           `json:"output_limit"`
+		AgentSessionID uint            `json:"agent_session_id"`
+	}
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
+		return h.failToolCall(c, userID, project.ID, 0, "agent.run_command", invalidBodyAuditInput(c), fiber.StatusBadRequest, "Invalid request body")
 	}
-	command, err := normalizeCommand(req.Command)
+	sessionID, ok := h.validateToolSessionForTool(c, userID, project.ID, req.AgentSessionID, "agent.run_command", req)
+	if !ok {
+		return nil
+	}
+
+	cmd, err := parseCommand(req.Command)
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		return h.failToolCall(c, userID, project.ID, sessionID, "agent.run_command", req, fiber.StatusBadRequest, err.Error())
 	}
-	workingDir := strings.TrimSpace(req.WorkingDir)
-	if workingDir == "" {
-		workingDir = workspaceMountPath
+	workDirInput := req.WorkingDir
+	if strings.TrimSpace(workDirInput) == "" {
+		workDirInput = req.CWD
 	}
-	if !containerWorkspacePathOK(workingDir) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "working_dir must stay under /workspace"})
+	workDir, err := resolveSandboxPath(sandbox.WorkspacePath, workDirInput)
+	if err != nil {
+		return h.failToolCall(c, userID, project.ID, sessionID, "agent.run_command", req, fiber.StatusBadRequest, err.Error())
 	}
-	timeoutSec := req.TimeoutSec
-	if timeoutSec <= 0 {
-		timeoutSec = 120
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout(req.TimeoutSec))
 	defer cancel()
-	output, exitCode, err := h.dockerService.ExecInContainer(ctx, project.ContainerID, command, workingDir, nil)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error(), "output": output, "exit_code": exitCode})
-	}
-	limit := req.OutputLimit
-	if limit <= 0 {
-		limit = 1_000_000
-	}
-	truncated := false
-	if len([]byte(output)) > limit {
-		output = string([]byte(output)[:limit])
-		truncated = true
+	output, exitCode, truncated, execErr := h.dockerService.ExecInContainerLimited(ctx, sandbox.ContainerID, cmd, workDir, req.Env, outputLimit(req.OutputLimit))
+	h.recordToolCall(userID, project.ID, sessionID, "agent.run_command", req, output, exitCode, execErr)
+	if execErr != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to run command: " + execErr.Error()})
 	}
 	return c.JSON(fiber.Map{"output": output, "exit_code": exitCode, "truncated": truncated})
 }
 
 func (h *ProjectHandler) ReadFile(c *fiber.Ctx) error {
-	project, err := h.getProject(c.Params("id"))
-	if err != nil {
-		return notFound(c, "project not found")
+	userID := middleware.GetUserID(c)
+	project, sandbox, ok := h.loadToolSandbox(c, userID)
+	if !ok {
+		return nil
 	}
-	var req FilePathRequest
+
+	var req struct {
+		Path           string `json:"path"`
+		AgentSessionID uint   `json:"agent_session_id"`
+	}
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
+		return h.failToolCall(c, userID, project.ID, 0, "agent.read_file", invalidBodyAuditInput(c), fiber.StatusBadRequest, "Invalid request body")
 	}
-	path, err := resolveWorkspacePath(project.Workspace, req.Path)
+	sessionID, ok := h.validateToolSessionForTool(c, userID, project.ID, req.AgentSessionID, "agent.read_file", req)
+	if !ok {
+		return nil
+	}
+	sourcePath, err := resolveSandboxPath(sandbox.WorkspacePath, req.Path)
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		return h.failToolCall(c, userID, project.ID, sessionID, "agent.read_file", req, fiber.StatusBadRequest, err.Error())
 	}
-	content, err := os.ReadFile(path)
+
+	reader, err := h.dockerService.DownloadFromContainer(context.Background(), sandbox.ContainerID, sourcePath)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		h.recordToolCall(userID, project.ID, sessionID, "agent.read_file", req, "", 0, err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to read file: " + err.Error()})
 	}
-	return c.JSON(fiber.Map{"path": path, "file_name": filepath.Base(path), "bytes": len(content), "content": string(content), "truncated": false})
+	defer reader.Close()
+
+	name, fileBytes, truncated, err := firstFileFromTarReaderLimited(reader, defaultOutputLimitBytes)
+	if err != nil {
+		h.recordToolCall(userID, project.ID, sessionID, "agent.read_file", req, "", 0, err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to extract file: " + err.Error()})
+	}
+	content := string(fileBytes)
+	outputSummary := fmt.Sprintf("read %d bytes", len(fileBytes))
+	if truncated {
+		outputSummary += " (truncated)"
+	}
+	h.recordToolCall(userID, project.ID, sessionID, "agent.read_file", req, outputSummary, 0, nil)
+	return c.JSON(fiber.Map{
+		"file_name":      name,
+		"path":           sourcePath,
+		"content":        content,
+		"content_base64": base64.StdEncoding.EncodeToString(fileBytes),
+		"bytes":          len(fileBytes),
+		"truncated":      truncated,
+	})
 }
 
 func (h *ProjectHandler) WriteFile(c *fiber.Ctx) error {
-	project, err := h.getProject(c.Params("id"))
-	if err != nil {
-		return notFound(c, "project not found")
+	userID := middleware.GetUserID(c)
+	project, sandbox, ok := h.loadToolSandbox(c, userID)
+	if !ok {
+		return nil
 	}
-	var req FileWriteRequest
+
+	var req struct {
+		Path           string `json:"path"`
+		Content        string `json:"content"`
+		ContentBase64  string `json:"content_base64"`
+		AgentSessionID uint   `json:"agent_session_id"`
+	}
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
+		return h.failToolCall(c, userID, project.ID, 0, "agent.write_file", invalidBodyAuditInput(c), fiber.StatusBadRequest, "Invalid request body")
 	}
-	path, err := resolveWorkspacePath(project.Workspace, req.Path)
+	sessionID, ok := h.validateToolSessionForTool(c, userID, project.ID, req.AgentSessionID, "agent.write_file", req)
+	if !ok {
+		return nil
+	}
+	targetPath, err := resolveSandboxPath(sandbox.WorkspacePath, req.Path)
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		return h.failToolCall(c, userID, project.ID, sessionID, "agent.write_file", req, fiber.StatusBadRequest, err.Error())
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	if targetPath == sandbox.WorkspacePath || strings.HasSuffix(targetPath, "/") {
+		return h.failToolCall(c, userID, project.ID, sessionID, "agent.write_file", req, fiber.StatusBadRequest, "path must identify a file")
 	}
-	if err := os.WriteFile(path, []byte(req.Content), 0o644); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+
+	data := []byte(req.Content)
+	if req.ContentBase64 != "" {
+		data, err = base64.StdEncoding.DecodeString(req.ContentBase64)
+		if err != nil {
+			return h.failToolCall(c, userID, project.ID, sessionID, "agent.write_file", req, fiber.StatusBadRequest, "content_base64 is not valid base64")
+		}
 	}
-	return c.JSON(fiber.Map{"message": "File written"})
+
+	dir := path.Dir(targetPath)
+	fileName := path.Base(targetPath)
+	if _, exitCode, err := h.dockerService.ExecInContainer(context.Background(), sandbox.ContainerID, []string{"mkdir", "-p", dir}, sandbox.WorkspacePath, nil); err != nil || exitCode != 0 {
+		if err == nil {
+			err = fmt.Errorf("mkdir exited with code %d", exitCode)
+		}
+		h.recordToolCall(userID, project.ID, sessionID, "agent.write_file", req, "", exitCode, err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to prepare destination: " + err.Error()})
+	}
+	if err := h.dockerService.UploadFileToContainer(context.Background(), sandbox.ContainerID, dir, fileName, data); err != nil {
+		h.recordToolCall(userID, project.ID, sessionID, "agent.write_file", req, "", 0, err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to write file: " + err.Error()})
+	}
+	h.recordToolCall(userID, project.ID, sessionID, "agent.write_file", req, fmt.Sprintf("wrote %d bytes", len(data)), 0, nil)
+	return c.JSON(fiber.Map{"message": "File written successfully", "path": targetPath, "bytes": len(data)})
 }
 
 func (h *ProjectHandler) ListFiles(c *fiber.Ctx) error {
-	project, err := h.getProject(c.Params("id"))
-	if err != nil {
-		return notFound(c, "project not found")
-	}
-	var req FilePathRequest
-	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
-	}
-	path, err := resolveWorkspacePath(project.Workspace, defaultString(req.Path, "."))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
-	}
-	rows := []string{}
-	if err := filepath.WalkDir(path, func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() && d.Name() == ".git" {
-			return filepath.SkipDir
-		}
-		if p == path {
-			return nil
-		}
-		rel, _ := filepath.Rel(project.Workspace, p)
-		rel = filepath.ToSlash(rel)
-		if d.IsDir() {
-			rel += "/"
-		}
-		rows = append(rows, rel)
+	userID := middleware.GetUserID(c)
+	project, sandbox, ok := h.loadToolSandbox(c, userID)
+	if !ok {
 		return nil
-	}); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
-	return c.JSON(fiber.Map{"output": strings.Join(rows, "\n"), "exit_code": 0, "truncated": false})
+
+	var req struct {
+		Path           string `json:"path"`
+		AgentSessionID uint   `json:"agent_session_id"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return h.failToolCall(c, userID, project.ID, 0, "agent.list_files", invalidBodyAuditInput(c), fiber.StatusBadRequest, "Invalid request body")
+	}
+	sessionID, ok := h.validateToolSessionForTool(c, userID, project.ID, req.AgentSessionID, "agent.list_files", req)
+	if !ok {
+		return nil
+	}
+	targetPath, err := resolveSandboxPath(sandbox.WorkspacePath, req.Path)
+	if err != nil {
+		return h.failToolCall(c, userID, project.ID, sessionID, "agent.list_files", req, fiber.StatusBadRequest, err.Error())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout(0))
+	defer cancel()
+	cmd := []string{"sh", "-c", "ls -la " + shellQuote(targetPath)}
+	output, exitCode, truncated, execErr := h.dockerService.ExecInContainerLimited(ctx, sandbox.ContainerID, cmd, sandbox.WorkspacePath, nil, defaultOutputLimitBytes)
+	h.recordToolCall(userID, project.ID, sessionID, "agent.list_files", req, output, exitCode, execErr)
+	if execErr != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to list files: " + execErr.Error()})
+	}
+	return c.JSON(fiber.Map{"path": targetPath, "output": output, "exit_code": exitCode, "truncated": truncated})
 }
 
-func (h *ProjectHandler) SearchFiles(c *fiber.Ctx) error {
-	project, err := h.getProject(c.Params("id"))
-	if err != nil {
-		return notFound(c, "project not found")
-	}
-	var req SearchRequest
-	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
-	}
-	root, err := resolveWorkspacePath(project.Workspace, defaultString(req.Path, "."))
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
-	}
-	rows := []string{}
-	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil || d.IsDir() {
-			if d != nil && d.IsDir() && d.Name() == ".git" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		content, readErr := os.ReadFile(p)
-		if readErr != nil || bytes.Contains(content, []byte{0}) {
-			return nil
-		}
-		for i, line := range strings.Split(string(content), "\n") {
-			if strings.Contains(line, req.Query) {
-				rel, _ := filepath.Rel(project.Workspace, p)
-				rows = append(rows, fmt.Sprintf("%s:%d:%s", filepath.ToSlash(rel), i+1, line))
-			}
-		}
+func (h *ProjectHandler) Search(c *fiber.Ctx) error {
+	userID := middleware.GetUserID(c)
+	project, sandbox, ok := h.loadToolSandbox(c, userID)
+	if !ok {
 		return nil
-	})
-	return c.JSON(fiber.Map{"output": strings.Join(rows, "\n"), "exit_code": 0, "truncated": false})
-}
-
-func (h *ProjectHandler) GitStatus(c *fiber.Ctx) error {
-	project, err := h.getProject(c.Params("id"))
-	if err != nil {
-		return notFound(c, "project not found")
 	}
-	out, code := runGit(project.Workspace, "status", "--short")
-	return c.JSON(fiber.Map{"status": out, "exit_code": code, "truncated": false})
+
+	var req struct {
+		Query          string `json:"query"`
+		Path           string `json:"path"`
+		AgentSessionID uint   `json:"agent_session_id"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return h.failToolCall(c, userID, project.ID, 0, "agent.search", invalidBodyAuditInput(c), fiber.StatusBadRequest, "Invalid request body")
+	}
+	sessionID, ok := h.validateToolSessionForTool(c, userID, project.ID, req.AgentSessionID, "agent.search", req)
+	if !ok {
+		return nil
+	}
+	query := strings.TrimSpace(req.Query)
+	if query == "" {
+		return h.failToolCall(c, userID, project.ID, sessionID, "agent.search", req, fiber.StatusBadRequest, "query is required")
+	}
+	targetPath, err := resolveSandboxPath(sandbox.WorkspacePath, req.Path)
+	if err != nil {
+		return h.failToolCall(c, userID, project.ID, sessionID, "agent.search", req, fiber.StatusBadRequest, err.Error())
+	}
+
+	cmd := []string{"sh", "-c", "grep -RIn --exclude-dir=.git -- " + shellQuote(query) + " " + shellQuote(targetPath)}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	output, exitCode, truncated, execErr := h.dockerService.ExecInContainerLimited(ctx, sandbox.ContainerID, cmd, sandbox.WorkspacePath, nil, defaultOutputLimitBytes)
+	h.recordToolCall(userID, project.ID, sessionID, "agent.search", req, output, exitCode, execErr)
+	if execErr != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to search: " + execErr.Error()})
+	}
+	return c.JSON(fiber.Map{"output": output, "exit_code": exitCode, "truncated": truncated})
 }
 
 func (h *ProjectHandler) GitDiff(c *fiber.Ctx) error {
-	project, err := h.getProject(c.Params("id"))
-	if err != nil {
-		return notFound(c, "project not found")
+	userID := middleware.GetUserID(c)
+	project, sandbox, ok := h.loadToolSandbox(c, userID)
+	if !ok {
+		return nil
 	}
-	out, code := runGit(project.Workspace, "diff")
-	return c.JSON(fiber.Map{"diff": out, "exit_code": code, "truncated": false})
+	sessionID, ok := h.toolSessionFromQueryForTool(c, userID, project.ID, "agent.git_diff", fiber.Map{})
+	if !ok {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout(0))
+	defer cancel()
+	output, exitCode, truncated, err := h.dockerService.ExecInContainerLimited(ctx, sandbox.ContainerID, []string{"git", "-C", sandbox.WorkspacePath, "diff", "--"}, sandbox.WorkspacePath, nil, defaultOutputLimitBytes)
+	h.recordToolCall(userID, project.ID, sessionID, "agent.git_diff", fiber.Map{}, output, exitCode, err)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to get git diff: " + err.Error()})
+	}
+	return c.JSON(fiber.Map{"diff": output, "exit_code": exitCode, "truncated": truncated})
+}
+
+func (h *ProjectHandler) GitStatus(c *fiber.Ctx) error {
+	userID := middleware.GetUserID(c)
+	project, sandbox, ok := h.loadToolSandbox(c, userID)
+	if !ok {
+		return nil
+	}
+	sessionID, ok := h.toolSessionFromQueryForTool(c, userID, project.ID, "agent.git_status", fiber.Map{})
+	if !ok {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout(0))
+	defer cancel()
+	output, exitCode, truncated, err := h.dockerService.ExecInContainerLimited(ctx, sandbox.ContainerID, []string{"git", "-C", sandbox.WorkspacePath, "status", "--short"}, sandbox.WorkspacePath, nil, defaultOutputLimitBytes)
+	h.recordToolCall(userID, project.ID, sessionID, "agent.git_status", fiber.Map{}, output, exitCode, err)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to get git status: " + err.Error()})
+	}
+	return c.JSON(fiber.Map{"status": output, "exit_code": exitCode, "truncated": truncated})
 }
 
 func (h *ProjectHandler) GitCommit(c *fiber.Ctx) error {
-	project, err := h.getProject(c.Params("id"))
-	if err != nil {
-		return notFound(c, "project not found")
+	userID := middleware.GetUserID(c)
+	project, sandbox, ok := h.loadToolSandbox(c, userID)
+	if !ok {
+		return nil
 	}
-	var req CommitRequest
+
+	var req struct {
+		Message        string `json:"message"`
+		AgentSessionID uint   `json:"agent_session_id"`
+	}
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
+		return h.failToolCall(c, userID, project.ID, 0, "agent.git_commit", invalidBodyAuditInput(c), fiber.StatusBadRequest, "Invalid request body")
 	}
-	if strings.TrimSpace(req.Message) == "" {
-		req.Message = "DoCode changes"
+	sessionID, ok := h.validateToolSessionForTool(c, userID, project.ID, req.AgentSessionID, "agent.git_commit", req)
+	if !ok {
+		return nil
 	}
-	runGit(project.Workspace, "add", ".")
-	out, code := runGit(project.Workspace, "commit", "-m", req.Message)
-	return c.JSON(fiber.Map{"output": out, "exit_code": code, "truncated": false})
+	message := strings.TrimSpace(req.Message)
+	if message == "" {
+		return h.failToolCall(c, userID, project.ID, sessionID, "agent.git_commit", req, fiber.StatusBadRequest, "message is required")
+	}
+
+	cmd := []string{"sh", "-c", "git -C " + shellQuote(sandbox.WorkspacePath) + " add -A && git -C " + shellQuote(sandbox.WorkspacePath) + " commit -m " + shellQuote(message)}
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout(0))
+	defer cancel()
+	output, exitCode, truncated, err := h.dockerService.ExecInContainerLimited(ctx, sandbox.ContainerID, cmd, sandbox.WorkspacePath, nil, defaultOutputLimitBytes)
+	h.recordToolCall(userID, project.ID, sessionID, "agent.git_commit", req, output, exitCode, err)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to commit: " + err.Error()})
+	}
+	return c.JSON(fiber.Map{"output": output, "exit_code": exitCode, "truncated": truncated})
 }
 
 func (h *ProjectHandler) Preview(c *fiber.Ctx) error {
-	var req struct {
-		Port int `json:"port"`
+	userID := middleware.GetUserID(c)
+	project, sandbox, ok := h.loadToolSandbox(c, userID)
+	if !ok {
+		return nil
 	}
-	_ = c.BodyParser(&req)
-	return c.JSON(fiber.Map{"status": "preview_descriptor", "port": req.Port, "message": "Preview proxy is not configured"})
+
+	var req struct {
+		Port           int  `json:"port"`
+		AgentSessionID uint `json:"agent_session_id"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return h.failToolCall(c, userID, project.ID, 0, "agent.preview", invalidBodyAuditInput(c), fiber.StatusBadRequest, "Invalid request body")
+	}
+	sessionID, ok := h.validateToolSessionForTool(c, userID, project.ID, req.AgentSessionID, "agent.preview", req)
+	if !ok {
+		return nil
+	}
+	if req.Port < 1 || req.Port > 65535 {
+		return h.failToolCall(c, userID, project.ID, sessionID, "agent.preview", req, fiber.StatusBadRequest, "valid port is required")
+	}
+
+	result := previewDescriptor(project.ID, sandbox.ID, req.Port)
+	h.recordToolCall(userID, project.ID, sessionID, "agent.preview", req, fmt.Sprintf("preview port %d", req.Port), 0, nil)
+	return c.JSON(result)
 }
 
-func (h *ProjectHandler) Logs(c *fiber.Ctx) error {
-	project, err := h.getProject(c.Params("id"))
-	if err != nil {
-		return notFound(c, "project not found")
+func (h *ProjectHandler) GetLogs(c *fiber.Ctx) error {
+	userID := middleware.GetUserID(c)
+	project, sandbox, ok := h.loadToolSandbox(c, userID)
+	if !ok {
+		return nil
 	}
 	tail := c.Query("tail", "200")
-	logs, err := h.dockerService.GetContainerLogs(context.Background(), project.ContainerID, tail)
+	since := c.Query("since", "")
+	until := c.Query("until", "")
+	sessionID, ok := h.toolSessionFromQueryForTool(c, userID, project.ID, "agent.logs", fiber.Map{"tail": tail, "since": since, "until": until})
+	if !ok {
+		return nil
+	}
+
+	logs, err := h.dockerService.GetContainerLogsWithOptions(context.Background(), sandbox.ContainerID, docker.LogOptions{
+		Tail:  tail,
+		Since: since,
+		Until: until,
+	})
+	h.recordToolCall(userID, project.ID, sessionID, "agent.logs", fiber.Map{"tail": tail, "since": since, "until": until}, logs, 0, err)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to get logs: " + err.Error()})
 	}
 	return c.JSON(fiber.Map{"logs": logs})
 }
 
-func (h *ProjectHandler) Archive(c *fiber.Ctx) error {
-	project, err := h.getProject(c.Params("id"))
+func (h *ProjectHandler) ArchiveWorkspace(c *fiber.Ctx) error {
+	userID := middleware.GetUserID(c)
+	project, sandbox, ok := h.loadToolSandbox(c, userID)
+	if !ok {
+		return nil
+	}
+	sessionID, ok := h.toolSessionFromQueryForTool(c, userID, project.ID, "agent.archive", fiber.Map{"path": sandbox.WorkspacePath})
+	if !ok {
+		return nil
+	}
+
+	reader, err := h.dockerService.DownloadFromContainer(context.Background(), sandbox.ContainerID, sandbox.WorkspacePath)
+	h.recordToolCall(userID, project.ID, sessionID, "agent.archive", fiber.Map{"path": sandbox.WorkspacePath}, "", 0, err)
 	if err != nil {
-		return notFound(c, "project not found")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to archive workspace: " + err.Error()})
 	}
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	err = filepath.WalkDir(project.Workspace, func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() && d.Name() == ".git" {
-			return filepath.SkipDir
-		}
-		if d.IsDir() {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(project.Workspace, p)
-		if err != nil {
-			return err
-		}
-		header, err := tar.FileInfoHeader(info, "")
-		if err != nil {
-			return err
-		}
-		header.Name = filepath.ToSlash(rel)
-		if err := tw.WriteHeader(header); err != nil {
-			return err
-		}
-		file, err := os.Open(p)
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-		_, err = io.Copy(tw, file)
-		return err
-	})
-	if err != nil {
-		_ = tw.Close()
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
-	}
-	if err := tw.Close(); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
-	}
+	defer reader.Close()
+
 	c.Set("Content-Type", "application/x-tar")
-	return c.Send(buf.Bytes())
+	c.Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"dobox-project-%d-workspace.tar\"", project.ID))
+	return c.SendStream(reader)
 }
 
-func (h *ProjectHandler) getProject(id string) (*models.Project, error) {
+func (h *ProjectHandler) cloneRepo(ctx context.Context, sandbox models.Sandbox, repoURL, branch string) (string, int, error) {
+	cmd := []string{"git", "clone", "--depth", "1"}
+	if strings.TrimSpace(branch) != "" {
+		cmd = append(cmd, "--branch", strings.TrimSpace(branch))
+	}
+	cmd = append(cmd, repoURL, ".")
+	return h.dockerService.ExecInContainer(ctx, sandbox.ContainerID, cmd, sandbox.WorkspacePath, nil)
+}
+
+func (h *ProjectHandler) getOwnedProjectSandbox(userID uint, projectID string) (*models.Project, *models.Sandbox, error) {
 	var project models.Project
-	if err := database.DB.Where("id = ?", id).First(&project).Error; err != nil {
-		return nil, err
+	if err := database.DB.Where("id = ? AND user_id = ?", projectID, userID).First(&project).Error; err != nil {
+		return nil, nil, err
 	}
-	return &project, nil
+	var sandbox models.Sandbox
+	if err := database.DB.Where("project_id = ? AND user_id = ?", project.ID, userID).First(&sandbox).Error; err != nil {
+		return nil, nil, err
+	}
+	return &project, &sandbox, nil
 }
 
-func (h *ProjectHandler) prepareWorkspace(workspace, repoURL, branch string) error {
-	if strings.TrimSpace(repoURL) == "" {
-		return ensureGitRepository(workspace)
-	}
-	source := strings.TrimSpace(repoURL)
-	if stat, err := os.Stat(source); err == nil && stat.IsDir() {
-		if err := copyDir(source, workspace); err != nil {
-			return err
-		}
-		return ensureGitRepository(workspace)
-	}
-	args := []string{"clone", source, workspace}
-	if branch = strings.TrimSpace(branch); branch != "" {
-		args = []string{"clone", "--branch", branch, "--single-branch", source, workspace}
-	}
-	cmd := exec.Command("git", args...)
-	out, err := cmd.CombinedOutput()
+func (h *ProjectHandler) loadToolSandbox(c *fiber.Ctx, userID uint) (*models.Project, *models.Sandbox, bool) {
+	project, sandbox, err := h.getOwnedProjectSandbox(userID, c.Params("projectId"))
 	if err != nil {
-		return fmt.Errorf("git clone failed: %s", string(out))
+		if err == gorm.ErrRecordNotFound {
+			_ = c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Project not found"})
+			return nil, nil, false
+		}
+		_ = c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to load project sandbox"})
+		return nil, nil, false
 	}
-	return ensureGitConfig(workspace)
+	return project, sandbox, true
 }
 
-func ensureGitRepository(workspace string) error {
-	if _, err := os.Stat(filepath.Join(workspace, ".git")); err == nil {
-		return ensureGitConfig(workspace)
+func (h *ProjectHandler) validateToolSession(c *fiber.Ctx, userID, projectID, sessionID uint) (uint, bool) {
+	if sessionID == 0 {
+		return 0, true
 	}
-	if out, err := exec.Command("git", "-C", workspace, "init").CombinedOutput(); err != nil {
-		return fmt.Errorf("git init failed: %s", string(out))
-	}
-	if err := ensureGitConfig(workspace); err != nil {
-		return err
-	}
-	if out, err := exec.Command("git", "-C", workspace, "add", ".").CombinedOutput(); err != nil {
-		return fmt.Errorf("git add failed: %s", string(out))
-	}
-	if out, err := exec.Command("git", "-C", workspace, "commit", "-m", "initial").CombinedOutput(); err != nil {
-		text := string(out)
-		if !strings.Contains(strings.ToLower(text), "nothing to commit") {
-			return fmt.Errorf("git commit failed: %s", text)
+	var session models.AgentSession
+	if err := database.DB.Where("id = ? AND user_id = ? AND project_id = ?", sessionID, userID, projectID).First(&session).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			_ = c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "agent_session_id does not belong to project"})
+			return 0, false
 		}
+		_ = c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to validate agent session"})
+		return 0, false
 	}
-	return nil
+	return sessionID, true
 }
 
-func ensureGitConfig(workspace string) error {
-	commands := [][]string{
-		{"config", "user.email", "dobox@example.local"},
-		{"config", "user.name", "DoBox"},
+func (h *ProjectHandler) validateToolSessionForTool(c *fiber.Ctx, userID, projectID, sessionID uint, toolName string, input any) (uint, bool) {
+	if sessionID == 0 {
+		return 0, true
 	}
-	for _, args := range commands {
-		if out, err := exec.Command("git", append([]string{"-C", workspace}, args...)...).CombinedOutput(); err != nil {
-			return fmt.Errorf("git %s failed: %s", strings.Join(args, " "), string(out))
+	var session models.AgentSession
+	if err := database.DB.Where("id = ? AND user_id = ? AND project_id = ?", sessionID, userID, projectID).First(&session).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			h.recordToolCall(userID, projectID, 0, toolName, input, "", 2, fmt.Errorf("agent_session_id does not belong to project"))
+			_ = c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "agent_session_id does not belong to project"})
+			return 0, false
 		}
+		h.recordToolCall(userID, projectID, 0, toolName, input, "", 2, fmt.Errorf("failed to validate agent session: %w", err))
+		_ = c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to validate agent session"})
+		return 0, false
 	}
-	return nil
+	return sessionID, true
 }
 
-func copyDir(src, dst string) error {
-	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.Name() == ".git" && d.IsDir() {
-			return filepath.SkipDir
-		}
-		rel, err := filepath.Rel(src, path)
-		if err != nil || rel == "." {
-			return err
-		}
-		target := filepath.Join(dst, rel)
-		if d.IsDir() {
-			return os.MkdirAll(target, 0o755)
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		in, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer in.Close()
-		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
-		if err != nil {
-			return err
-		}
-		defer out.Close()
-		_, err = io.Copy(out, in)
-		return err
-	})
+func (h *ProjectHandler) toolSessionFromQuery(c *fiber.Ctx, userID, projectID uint) (uint, bool) {
+	raw := strings.TrimSpace(c.Query("agent_session_id"))
+	if raw == "" {
+		return 0, true
+	}
+	n, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || n == 0 {
+		_ = c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "agent_session_id must be a positive integer"})
+		return 0, false
+	}
+	return h.validateToolSession(c, userID, projectID, uint(n))
 }
 
-func runGit(workspace string, args ...string) (string, int) {
-	cmd := exec.Command("git", append([]string{"-C", workspace}, args...)...)
-	out, err := cmd.CombinedOutput()
+func (h *ProjectHandler) toolSessionFromQueryForTool(c *fiber.Ctx, userID, projectID uint, toolName string, input any) (uint, bool) {
+	raw := strings.TrimSpace(c.Query("agent_session_id"))
+	if raw == "" {
+		return 0, true
+	}
+	n, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || n == 0 {
+		h.recordToolCall(userID, projectID, 0, toolName, input, "", 2, fmt.Errorf("agent_session_id must be a positive integer"))
+		_ = c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "agent_session_id must be a positive integer"})
+		return 0, false
+	}
+	return h.validateToolSessionForTool(c, userID, projectID, uint(n), toolName, input)
+}
+
+func (h *ProjectHandler) failToolCall(c *fiber.Ctx, userID, projectID, sessionID uint, toolName string, input any, status int, message string) error {
+	h.recordToolCall(userID, projectID, sessionID, toolName, input, "", 2, fmt.Errorf("%s", message))
+	return c.Status(status).JSON(fiber.Map{"error": message})
+}
+
+func invalidBodyAuditInput(c *fiber.Ctx) fiber.Map {
+	return fiber.Map{
+		"invalid_body": true,
+		"body_bytes":   len(c.Body()),
+	}
+}
+
+func (h *ProjectHandler) recordToolCall(userID, projectID, sessionID uint, toolName string, input any, output string, exitCode int, callErr error) {
+	status := "success"
+	errMessage := ""
+	if callErr != nil || exitCode != 0 {
+		status = "failed"
+	}
+	if callErr != nil {
+		errMessage = callErr.Error()
+	}
+	if len(output) > 16*1024 {
+		output = output[:16*1024]
+	}
+	_ = database.DB.Create(&models.ToolCall{
+		UserID:         userID,
+		ProjectID:      projectID,
+		AgentSessionID: sessionID,
+		ToolName:       toolName,
+		Status:         status,
+		Input:          auditInputJSON(input),
+		Output:         output,
+		ExitCode:       exitCode,
+		Error:          errMessage,
+	}).Error
+}
+
+func auditInputJSON(input any) string {
+	raw, err := json.Marshal(input)
 	if err != nil {
-		if exit, ok := err.(*exec.ExitError); ok {
-			return string(out), exit.ExitCode()
-		}
-		return string(out) + err.Error(), 1
+		return "{}"
 	}
-	return string(out), 0
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return string(raw)
+	}
+	sanitized := sanitizeAuditValue("", value)
+	out, err := json.Marshal(sanitized)
+	if err != nil {
+		return "{}"
+	}
+	return string(out)
 }
 
-func normalizeCommand(value any) ([]string, error) {
-	switch command := value.(type) {
+func previewDescriptor(projectID, sandboxID uint, port int) fiber.Map {
+	return fiber.Map{
+		"project_id": projectID,
+		"sandbox_id": sandboxID,
+		"port":       port,
+		"status":     "preview_descriptor",
+		"message":    "Preview proxy routing is not exposed by this endpoint; run the service in the sandbox and use the project preview integration.",
+	}
+}
+
+func sanitizeAuditValue(key string, value any) any {
+	lowerKey := strings.ToLower(key)
+	switch typed := value.(type) {
+	case map[string]any:
+		sanitized := make(map[string]any, len(typed))
+		for childKey, childValue := range typed {
+			sanitized[childKey] = sanitizeAuditValue(childKey, childValue)
+		}
+		return sanitized
+	case []any:
+		if lowerKey == "env" {
+			return fiber.Map{"count": len(typed), "redacted": true}
+		}
+		sanitized := make([]any, 0, len(typed))
+		for _, item := range typed {
+			sanitized = append(sanitized, sanitizeAuditValue("", item))
+		}
+		return sanitized
 	case string:
-		if strings.TrimSpace(command) == "" {
+		switch lowerKey {
+		case "content":
+			contentBytes := len([]byte(typed))
+			return fiber.Map{
+				"bytes":    contentBytes,
+				"redacted": true,
+			}
+		case "content_base64":
+			return fiber.Map{"base64_bytes": len(typed), "redacted": true}
+		}
+		return typed
+	default:
+		return value
+	}
+}
+
+func auditListLimit(raw string) int {
+	limit, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || limit <= 0 {
+		return 100
+	}
+	if limit > 500 {
+		return 500
+	}
+	return limit
+}
+
+func parseCommand(raw json.RawMessage) ([]string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, fmt.Errorf("command is required")
+	}
+	var argv []string
+	if err := json.Unmarshal(raw, &argv); err == nil {
+		if len(argv) == 0 {
+			return nil, fmt.Errorf("command is required")
+		}
+		return argv, nil
+	}
+	var command string
+	if err := json.Unmarshal(raw, &command); err == nil {
+		command = strings.TrimSpace(command)
+		if command == "" {
 			return nil, fmt.Errorf("command is required")
 		}
 		return []string{"sh", "-lc", command}, nil
-	case []any:
-		result := make([]string, 0, len(command))
-		for _, item := range command {
-			text, ok := item.(string)
-			if !ok || strings.TrimSpace(text) == "" {
-				return nil, fmt.Errorf("command entries must be non-empty strings")
-			}
-			result = append(result, text)
-		}
-		if len(result) == 0 {
-			return nil, fmt.Errorf("command is required")
-		}
-		return result, nil
-	default:
-		return nil, fmt.Errorf("command must be a string or string array")
 	}
+	return nil, fmt.Errorf("command must be a string or string array")
 }
 
-func resolveWorkspacePath(workspace, raw string) (string, error) {
-	if strings.TrimSpace(raw) == "" {
-		raw = "."
+func commandTimeout(requestedSeconds int) time.Duration {
+	if requestedSeconds <= 0 {
+		requestedSeconds = defaultCommandTimeoutSeconds
 	}
-	clean := filepath.ToSlash(strings.TrimSpace(raw))
-	clean = strings.TrimPrefix(clean, workspaceMountPath)
-	clean = strings.TrimPrefix(clean, "/")
-	target := filepath.Clean(filepath.Join(workspace, filepath.FromSlash(clean)))
-	root, err := filepath.Abs(workspace)
-	if err != nil {
-		return "", err
+	if requestedSeconds > maxCommandTimeoutSeconds {
+		requestedSeconds = maxCommandTimeoutSeconds
 	}
-	abs, err := filepath.Abs(target)
-	if err != nil {
-		return "", err
-	}
-	if abs != root && !strings.HasPrefix(abs, root+string(os.PathSeparator)) {
-		return "", fmt.Errorf("path must stay under %s", workspaceMountPath)
-	}
-	return abs, nil
+	return time.Duration(requestedSeconds) * time.Second
 }
 
-func containerWorkspacePathOK(path string) bool {
-	clean := filepath.ToSlash(filepath.Clean(path))
-	return clean == workspaceMountPath || strings.HasPrefix(clean, workspaceMountPath+"/")
+func outputLimit(requestedBytes int64) int64 {
+	if requestedBytes <= 0 {
+		return defaultOutputLimitBytes
+	}
+	if requestedBytes > defaultOutputLimitBytes {
+		return defaultOutputLimitBytes
+	}
+	return requestedBytes
 }
 
-func projectNetworkMode(value string) (string, error) {
-	mode := strings.TrimSpace(value)
+func sandboxImage(requestedImage string) (string, error) {
+	image := strings.TrimSpace(requestedImage)
+	if image == "" || image == defaultSandboxImage {
+		return defaultSandboxImage, nil
+	}
+	return "", fmt.Errorf("project sandboxes must use %s", defaultSandboxImage)
+}
+
+func sandboxNetworkInternal(requestedMode string) (bool, error) {
+	mode := strings.ToLower(strings.TrimSpace(requestedMode))
 	switch mode {
-	case "", "project":
-		return "bridge", nil
-	case "no_internet":
-		return "none", nil
+	case "", "project", "bridge":
+		return false, nil
+	case "no_internet", "no-internet", "internal", "offline":
+		return true, nil
 	default:
-		return "", fmt.Errorf("unsupported network_mode: %s", mode)
+		return false, fmt.Errorf("project sandboxes only support project or no_internet network modes")
 	}
 }
 
-func hostVolume(path string) string {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return path
+func sandboxCPULimit(requestedCPU float64) float64 {
+	if requestedCPU <= 0 || requestedCPU > defaultCPULimit {
+		return defaultCPULimit
 	}
-	return abs
+	return requestedCPU
 }
 
-func defaultString(value, fallback string) string {
-	if strings.TrimSpace(value) == "" {
-		return fallback
+func sandboxMemoryLimit(requestedMemory int64) int64 {
+	if requestedMemory <= 0 || requestedMemory > defaultMemoryLimit {
+		return defaultMemoryLimit
 	}
-	return value
+	return requestedMemory
 }
 
-func notFound(c *fiber.Ctx, message string) error {
-	return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": message})
+func publicProjectResponse(project *models.Project, sandbox *models.Sandbox) ProjectResponse {
+	return ProjectResponse{
+		Project: PublicProject{
+			ID:        project.ID,
+			UserID:    project.UserID,
+			Name:      project.Name,
+			RepoURL:   project.RepoURL,
+			Branch:    project.Branch,
+			Workspace: project.Workspace,
+			SandboxID: project.SandboxID,
+			CreatedAt: project.CreatedAt,
+			UpdatedAt: project.UpdatedAt,
+		},
+		Sandbox: PublicSandbox{
+			ID:            sandbox.ID,
+			UserID:        sandbox.UserID,
+			ProjectID:     sandbox.ProjectID,
+			Name:          sandbox.Name,
+			Image:         sandbox.Image,
+			Status:        sandbox.Status,
+			WorkspacePath: sandbox.WorkspacePath,
+			CPULimit:      sandbox.CPULimit,
+			MemoryLimit:   sandbox.MemoryLimit,
+			CreatedAt:     sandbox.CreatedAt,
+			UpdatedAt:     sandbox.UpdatedAt,
+		},
+	}
 }
 
-func randomID(bytesLen int) string {
-	buf := make([]byte, bytesLen)
-	if _, err := rand.Read(buf); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
+func cleanWorkspace(workspace string) string {
+	workspace = strings.TrimSpace(workspace)
+	if workspace == "" {
+		return defaultWorkspacePath
 	}
-	return hex.EncodeToString(buf)
+	cleaned := path.Clean("/" + strings.TrimPrefix(workspace, "/"))
+	if cleaned == "/" {
+		return defaultWorkspacePath
+	}
+	return cleaned
+}
+
+func sandboxWorkspace(workspace string) (string, error) {
+	raw := strings.TrimSpace(workspace)
+	if raw == "" {
+		return defaultWorkspacePath, nil
+	}
+	for _, segment := range strings.Split(raw, "/") {
+		if segment == ".." {
+			return "", fmt.Errorf("project sandbox workspace must be %s", defaultWorkspacePath)
+		}
+	}
+	cleaned := path.Clean("/" + strings.TrimPrefix(raw, "/"))
+	if cleaned != defaultWorkspacePath {
+		return "", fmt.Errorf("project sandbox workspace must be %s", defaultWorkspacePath)
+	}
+	return defaultWorkspacePath, nil
+}
+
+func resolveSandboxPath(workspacePath, requestedPath string) (string, error) {
+	workspacePath = cleanWorkspace(workspacePath)
+	requestedPath = strings.TrimSpace(requestedPath)
+	if requestedPath == "" || requestedPath == "." {
+		return workspacePath, nil
+	}
+	var resolved string
+	if strings.HasPrefix(requestedPath, "/") {
+		resolved = path.Clean(requestedPath)
+	} else {
+		resolved = path.Clean(path.Join(workspacePath, requestedPath))
+	}
+	if resolved != workspacePath && !strings.HasPrefix(resolved, workspacePath+"/") {
+		return "", fmt.Errorf("path must stay inside %s", workspacePath)
+	}
+	return resolved, nil
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }

@@ -101,7 +101,15 @@ go run cmd/server/main.go
 
 后端将在 `http://localhost:3000` 启动。
 
-### 3. 启动前端
+### 3. 构建 Project Sandbox 镜像
+
+```bash
+docker build -t dobox/code-sandbox:latest ./sandbox
+```
+
+Project sandbox 使用固定的 `dobox/code-sandbox:latest` 镜像和固定的 `/workspace` 工作区。该镜像预置常用开发工具，默认以 UID/GID `1000:1000` 的 `docode` 用户运行，并让 `/workspace` 归该用户所有。通过项目文件 API 写入的文件也会保留该 UID/GID，避免 agent 写入后变成 root-owned 文件。
+
+### 4. 启动前端
 
 ```bash
 cd frontend
@@ -163,6 +171,26 @@ VITE_API_URL=http://localhost:3000/api
 - `POST /api/auth/login` - 用户登录
 - `GET /api/auth/me` - 获取当前用户信息
 
+### Project Sandbox / Agent 工具
+- `POST /api/projects` - 创建项目并自动创建独立 sandbox、volume、network
+- `GET /api/projects/:projectId` - 获取项目和 sandbox 摘要
+- `DELETE /api/projects/:projectId` - 删除项目及其 sandbox 资源
+- `POST /api/projects/:projectId/agent/sessions` - 创建 agent session
+- `GET /api/projects/:projectId/agent/sessions` - 列出项目 agent sessions
+- `GET /api/projects/:projectId/agent/tool-calls` - 列出项目 tool call 审计记录，支持 `agent_session_id` 和 `limit`
+- `POST /api/projects/:projectId/exec` - 在项目 sandbox 中执行命令
+- `POST /api/projects/:projectId/files/read` - 读取 workspace 文件，返回内容受后端大小上限约束并包含 `truncated`
+- `POST /api/projects/:projectId/files/write` - 写入 workspace 文件
+- `POST /api/projects/:projectId/files/list` - 列出 workspace 文件
+- `POST /api/projects/:projectId/files/search` - 搜索 workspace 文件
+- `GET /api/projects/:projectId/git/diff` - 获取 git diff
+- `POST /api/projects/:projectId/git/status` - 获取 git status
+- `POST /api/projects/:projectId/git/commit` - 提交 workspace 变更
+- `GET /api/projects/:projectId/artifacts/archive` - 导出 workspace tar
+- `GET /api/projects/:projectId/logs` - 获取 sandbox 日志
+
+Project tool call 审计会记录工具名、状态、输入摘要、输出摘要、exit code 和错误信息。持久化输入会保留路径、命令等上下文，但会对 `content`、`content_base64` 和 `env` 这类大字段或敏感字段做大小记录和脱敏。命令输出、搜索/列表输出和项目文件读取都受后端大小上限保护，调用方应检查响应中的 `truncated`。
+
 ### 容器管理
 - `GET /api/containers` - 列出所有容器
 - `POST /api/containers` - 创建新容器
@@ -181,8 +209,9 @@ VITE_API_URL=http://localhost:3000/api
 1. 生产环境务必修改 `JWT_SECRET`，并通过 Secret 管理系统注入。
 2. Docker Socket 权限等同于宿主机高权限入口，请限制可访问用户和部署环境。
 3. 为可创建的容器设置 CPU、内存、网络和镜像来源限制，避免资源滥用。
-4. 生产环境只允许可信 CORS 源，并启用 HTTPS。
-5. 漏洞报告方式见 `SECURITY.md`。
+4. Project sandbox 默认以非 root 用户 `1000:1000` 运行，并使用项目独立 bridge 网络；`network_mode=no_internet` 会创建 internal 网络，`host`、`container:...` 等原始 Docker 网络模式不允许由调用方传入。
+5. 生产环境只允许可信 CORS 源，并启用 HTTPS。
+6. 漏洞报告方式见 `SECURITY.md`。
 
 ## 生产部署
 
