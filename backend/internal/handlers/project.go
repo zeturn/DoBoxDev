@@ -493,12 +493,15 @@ func (h *ProjectHandler) WriteFile(c *fiber.Ctx) error {
 
 	dir := path.Dir(targetPath)
 	fileName := path.Base(targetPath)
-	if _, exitCode, err := h.dockerService.ExecInContainer(context.Background(), sandbox.ContainerID, []string{"mkdir", "-p", dir}, sandbox.WorkspacePath, nil); err != nil || exitCode != 0 {
-		if err == nil {
-			err = fmt.Errorf("mkdir exited with code %d", exitCode)
+	if dir != sandbox.WorkspacePath {
+		output, exitCode, err := h.dockerService.ExecInContainer(context.Background(), sandbox.ContainerID, []string{"mkdir", "-p", dir}, sandbox.WorkspacePath, nil)
+		if err != nil || exitCode != 0 {
+			if err == nil {
+				err = fmt.Errorf("mkdir exited with code %d: %s", exitCode, strings.TrimSpace(output))
+			}
+			h.recordToolCall(userID, project.ID, sessionID, "agent.write_file", req, output, exitCode, err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to prepare destination: " + err.Error()})
 		}
-		h.recordToolCall(userID, project.ID, sessionID, "agent.write_file", req, "", exitCode, err)
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to prepare destination: " + err.Error()})
 	}
 	if err := h.dockerService.UploadFileToContainer(context.Background(), sandbox.ContainerID, dir, fileName, data); err != nil {
 		h.recordToolCall(userID, project.ID, sessionID, "agent.write_file", req, "", 0, err)

@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"io"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"docode/internal/database"
+	"docode/internal/docker"
 	"docode/internal/models"
 
 	"github.com/gofiber/fiber/v2"
@@ -439,6 +442,108 @@ func TestProjectExecCanonicalAndAgentAliasRoutes(t *testing.T) {
 	}
 }
 
+func TestProjectWorkspaceReadWriteExecConsistency(t *testing.T) {
+	if os.Getenv("DOBOX_RUN_DOCKER_INTEGRATION") != "1" {
+		t.Skip("set DOBOX_RUN_DOCKER_INTEGRATION=1 to run Docker workspace integration test")
+	}
+	setupProjectHandlerTestDB(t)
+	dockerService, err := docker.NewDockerService()
+	if err != nil {
+		t.Skipf("docker unavailable: %v", err)
+	}
+	defer dockerService.Close()
+
+	app := fiber.New()
+	handler := NewProjectHandler(dockerService)
+	app.Use(func(c *fiber.Ctx) error {
+		c.Locals("userID", uint(7))
+		return c.Next()
+	})
+	app.Post("/projects", handler.CreateProject)
+	app.Delete("/projects/:projectId", handler.DeleteProject)
+	app.Post("/projects/:projectId/files/write", handler.WriteFile)
+	app.Post("/projects/:projectId/files/read", handler.ReadFile)
+	app.Post("/projects/:projectId/files/list", handler.ListFiles)
+	app.Post("/projects/:projectId/exec", handler.RunCommand)
+	app.Get("/projects/:projectId/git/status", handler.GitStatus)
+	app.Get("/projects/:projectId/git/diff", handler.GitDiff)
+
+	createResp := doProjectJSONRequest(t, app, "POST", "/projects", map[string]any{"name": "workspace-consistency"})
+	if createResp.StatusCode != fiber.StatusCreated {
+		t.Fatalf("expected create status %d, got %d: %s", fiber.StatusCreated, createResp.StatusCode, createResp.Body)
+	}
+	projectID := intFromMap(t, createResp.JSON, "project", "id")
+	t.Cleanup(func() {
+		req := httptest.NewRequest("DELETE", "/projects/"+strconv.Itoa(projectID), nil)
+		resp, err := app.Test(req, -1)
+		if err == nil && resp != nil {
+			_ = resp.Body.Close()
+		}
+	})
+
+	writeResp := doProjectJSONRequest(t, app, "POST", "/projects/"+strconv.Itoa(projectID)+"/files/write", map[string]any{
+		"path":    "cli.py",
+		"content": "print('ok')\n",
+	})
+	if writeResp.StatusCode != fiber.StatusOK {
+		t.Fatalf("expected write status %d, got %d: %s", fiber.StatusOK, writeResp.StatusCode, writeResp.Body)
+	}
+
+	readResp := doProjectJSONRequest(t, app, "POST", "/projects/"+strconv.Itoa(projectID)+"/files/read", map[string]any{"path": "cli.py"})
+	if readResp.StatusCode != fiber.StatusOK {
+		t.Fatalf("expected read status %d, got %d: %s", fiber.StatusOK, readResp.StatusCode, readResp.Body)
+	}
+	if got := stringFromMap(t, readResp.JSON, "content"); got != "print('ok')\n" {
+		t.Fatalf("unexpected read content: %q", got)
+	}
+
+	execResp := doProjectJSONRequest(t, app, "POST", "/projects/"+strconv.Itoa(projectID)+"/exec", map[string]any{
+		"command":     []string{"sh", "-c", "pwd && ls -la && stat cli.py && stat /workspace/cli.py && python3 cli.py"},
+		"working_dir": "/workspace",
+	})
+	if execResp.StatusCode != fiber.StatusOK {
+		t.Fatalf("expected exec status %d, got %d: %s", fiber.StatusOK, execResp.StatusCode, execResp.Body)
+	}
+	if exitCode := intFromMap(t, execResp.JSON, "exit_code"); exitCode != 0 {
+		t.Fatalf("expected exec exit 0, got %d: %s", exitCode, execResp.Body)
+	}
+	if output := stringFromMap(t, execResp.JSON, "output"); !strings.Contains(output, "ok") || !strings.Contains(output, "/workspace") {
+		t.Fatalf("exec output should include workspace and ok, got %s", output)
+	}
+
+	listResp := doProjectJSONRequest(t, app, "POST", "/projects/"+strconv.Itoa(projectID)+"/files/list", map[string]any{"path": "."})
+	if listResp.StatusCode != fiber.StatusOK {
+		t.Fatalf("expected list status %d, got %d: %s", fiber.StatusOK, listResp.StatusCode, listResp.Body)
+	}
+	if output := stringFromMap(t, listResp.JSON, "output"); !strings.Contains(output, "cli.py") {
+		t.Fatalf("list output should include cli.py, got %s", output)
+	}
+
+	initResp := doProjectJSONRequest(t, app, "POST", "/projects/"+strconv.Itoa(projectID)+"/exec", map[string]any{
+		"command":     []string{"sh", "-c", "git init && git config user.email test@example.test && git config user.name Test && git add -N cli.py"},
+		"working_dir": "/workspace",
+	})
+	if initResp.StatusCode != fiber.StatusOK || intFromMap(t, initResp.JSON, "exit_code") != 0 {
+		t.Fatalf("expected git init/add -N to succeed: status=%d body=%s", initResp.StatusCode, initResp.Body)
+	}
+
+	statusResp := doProjectJSONRequest(t, app, "GET", "/projects/"+strconv.Itoa(projectID)+"/git/status", nil)
+	if statusResp.StatusCode != fiber.StatusOK {
+		t.Fatalf("expected git status status %d, got %d: %s", fiber.StatusOK, statusResp.StatusCode, statusResp.Body)
+	}
+	if status := stringFromMap(t, statusResp.JSON, "status"); !strings.Contains(status, "cli.py") {
+		t.Fatalf("git status should include cli.py, got %s", status)
+	}
+
+	diffResp := doProjectJSONRequest(t, app, "GET", "/projects/"+strconv.Itoa(projectID)+"/git/diff", nil)
+	if diffResp.StatusCode != fiber.StatusOK {
+		t.Fatalf("expected git diff status %d, got %d: %s", fiber.StatusOK, diffResp.StatusCode, diffResp.Body)
+	}
+	if diff := stringFromMap(t, diffResp.JSON, "diff"); !strings.Contains(diff, "print('ok')") {
+		t.Fatalf("git diff should include cli.py content, got %s", diff)
+	}
+}
+
 func TestFirstFileFromTarReaderLimitedReportsTruncation(t *testing.T) {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
@@ -468,11 +573,85 @@ func TestFirstFileFromTarReaderLimitedReportsTruncation(t *testing.T) {
 	}
 }
 
+type projectTestResponse struct {
+	StatusCode int
+	Body       string
+	JSON       map[string]any
+}
+
+func doProjectJSONRequest(t *testing.T, app *fiber.App, method, target string, payload any) projectTestResponse {
+	t.Helper()
+	var body io.Reader
+	if payload != nil {
+		data, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("failed to marshal request payload: %v", err)
+		}
+		body = bytes.NewReader(data)
+	}
+	req := httptest.NewRequest(method, target, body)
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("%s %s failed: %v", method, target, err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	parsed := map[string]any{}
+	_ = json.Unmarshal(data, &parsed)
+	return projectTestResponse{StatusCode: resp.StatusCode, Body: string(data), JSON: parsed}
+}
+
+func intFromMap(t *testing.T, value map[string]any, keys ...string) int {
+	t.Helper()
+	var current any = value
+	for _, key := range keys {
+		mapping, ok := current.(map[string]any)
+		if !ok {
+			t.Fatalf("expected object while reading %v from %#v", keys, value)
+		}
+		current = mapping[key]
+	}
+	number, ok := current.(float64)
+	if !ok {
+		t.Fatalf("expected numeric value for %v, got %#v", keys, current)
+	}
+	return int(number)
+}
+
+func stringFromMap(t *testing.T, value map[string]any, keys ...string) string {
+	t.Helper()
+	var current any = value
+	for _, key := range keys {
+		mapping, ok := current.(map[string]any)
+		if !ok {
+			t.Fatalf("expected object while reading %v from %#v", keys, value)
+		}
+		current = mapping[key]
+	}
+	text, ok := current.(string)
+	if !ok {
+		t.Fatalf("expected string value for %v, got %#v", keys, current)
+	}
+	return text
+}
+
 func setupProjectHandlerTestDB(t *testing.T) {
 	t.Helper()
 	if err := database.Connect(filepath.Join(t.TempDir(), "dobox-test.db")); err != nil {
 		t.Fatalf("failed to initialize test database: %v", err)
 	}
+	t.Cleanup(func() {
+		if database.DB == nil {
+			return
+		}
+		sqlDB, err := database.DB.DB()
+		if err == nil {
+			_ = sqlDB.Close()
+		}
+	})
 }
 
 func seedOwnedProjectSandbox(t *testing.T) {

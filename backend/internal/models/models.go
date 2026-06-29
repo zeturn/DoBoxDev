@@ -17,17 +17,19 @@ type User struct {
 }
 
 type Project struct {
-	ID        uint      `gorm:"primarykey" json:"id"`
-	UserID    uint      `gorm:"not null;index" json:"user_id"`
-	Name      string    `gorm:"not null" json:"name"`
-	RepoURL   string    `json:"repo_url"`
-	Branch    string    `json:"branch"`
-	Workspace string    `json:"workspace"`
-	SandboxID uint      `json:"sandbox_id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	User      User      `gorm:"foreignKey:UserID" json:"-"`
-	Sandbox   *Sandbox  `gorm:"foreignKey:ProjectID" json:"sandbox,omitempty"`
+	ID        uint   `gorm:"primarykey" json:"id"`
+	UserID    uint   `gorm:"not null;index" json:"user_id"`
+	Name      string `gorm:"not null" json:"name"`
+	RepoURL   string `json:"repo_url"`
+	Branch    string `json:"branch"`
+	Workspace string `json:"workspace"`
+	SandboxID uint   `json:"sandbox_id"`
+	// Legacy column kept so older SQLite databases with projects.container_id NOT NULL can still accept inserts.
+	ContainerID string    `gorm:"column:container_id" json:"-"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	User        User      `gorm:"foreignKey:UserID" json:"-"`
+	Sandbox     *Sandbox  `gorm:"foreignKey:ProjectID" json:"sandbox,omitempty"`
 }
 
 type Sandbox struct {

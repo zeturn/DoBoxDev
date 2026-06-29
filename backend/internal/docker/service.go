@@ -222,6 +222,7 @@ func sandboxContainerCreateOptions(opts CreateSandboxOptions) (client.ContainerC
 			Image:      image,
 			User:       sandboxUser,
 			Env:        []string{"HOME=/home/docode"},
+			Cmd:        []string{"sh", "-c", "trap : TERM INT; sleep infinity & wait"},
 			WorkingDir: workspacePath,
 		},
 		HostConfig: &containerapi.HostConfig{
