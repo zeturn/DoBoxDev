@@ -737,6 +737,16 @@ func (h *ProjectHandler) ArchiveWorkspace(c *fiber.Ctx) error {
 }
 
 func (h *ProjectHandler) cloneRepo(ctx context.Context, sandbox models.Sandbox, repoURL, branch string) (string, int, error) {
+	cleanupOutput, cleanupExitCode, cleanupErr := h.dockerService.ExecInContainer(
+		ctx,
+		sandbox.ContainerID,
+		[]string{"sh", "-lc", "find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +"},
+		sandbox.WorkspacePath,
+		nil,
+	)
+	if cleanupErr != nil || cleanupExitCode != 0 {
+		return cleanupOutput, cleanupExitCode, cleanupErr
+	}
 	cmd := []string{"git", "clone", "--depth", "1"}
 	if strings.TrimSpace(branch) != "" {
 		cmd = append(cmd, "--branch", strings.TrimSpace(branch))
