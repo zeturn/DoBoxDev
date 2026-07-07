@@ -597,7 +597,14 @@ func (h *ProjectHandler) GitDiff(c *fiber.Ctx) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout(0))
 	defer cancel()
-	output, exitCode, truncated, err := h.dockerService.ExecInContainerLimited(ctx, sandbox.ContainerID, []string{"git", "-C", sandbox.WorkspacePath, "diff", "--"}, sandbox.WorkspacePath, nil, defaultOutputLimitBytes)
+	output, exitCode, truncated, err := h.dockerService.ExecInContainerLimited(
+		ctx,
+		sandbox.ContainerID,
+		[]string{"git", "--no-pager", "-C", sandbox.WorkspacePath, "diff", "--"},
+		sandbox.WorkspacePath,
+		nil,
+		defaultOutputLimitBytes,
+	)
 	h.recordToolCall(userID, project.ID, sessionID, "agent.git_diff", fiber.Map{}, output, exitCode, err)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to get git diff: " + err.Error()})
