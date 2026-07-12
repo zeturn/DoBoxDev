@@ -9,7 +9,7 @@ require (
 	github.com/gofiber/fiber/v2 v2.52.14
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/joho/godotenv v1.5.1
-	github.com/moby/moby/api v1.54.0
+	github.com/moby/moby/api v1.55.0
 	github.com/moby/moby/client v0.3.0
 	golang.org/x/crypto v0.49.0
 	gorm.io/gorm v1.31.1
