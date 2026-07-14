@@ -13,12 +13,12 @@ import type { ReactElement } from 'react';
 const PrivateRoute = ({ children }: { children: ReactElement }) => {
   const { isAuthenticated, isLoading } = useAuth();
   
-  if (isLoading) {
+    if (isLoading) {
     return (
-      <div className="flex justify-center items-center min-h-screen bg-neutral-50">
+      <div className="flex justify-center items-center min-h-screen bg-neutral-50 dark:bg-neutral-950">
         <div className="text-center">
           <div className="inline-block w-12 h-12 border-4 border-primary-500 border-t-transparent rounded-full animate-spin"></div>
-          <p className="mt-4 text-neutral-600">加载中...</p>
+          <p className="mt-4 text-neutral-600 dark:text-neutral-400">加载中...</p>
         </div>
       </div>
     );

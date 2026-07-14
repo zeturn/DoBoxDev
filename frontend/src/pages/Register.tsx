@@ -3,6 +3,7 @@ import { useNavigate, Link } from 'react-router-dom';
 import { Container as ContainerIcon, AlertCircle } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
 import { Input, Button, Card } from '@zeturn/watercolor-react';
+import ThemeToggle from '../components/ThemeToggle';
 
 const Register = () => {
   const [loading, setLoading] = useState(false);
@@ -55,15 +56,18 @@ const Register = () => {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-primary-50 via-neutral-50 to-primary-100 p-6 sm:p-8">
+    <div className="relative min-h-screen flex items-center justify-center bg-gradient-to-br from-primary-50 via-neutral-50 to-primary-100 p-6 sm:p-8 dark:from-primary-950 dark:via-neutral-950 dark:to-neutral-900">
+      <div className="absolute top-4 right-4">
+        <ThemeToggle />
+      </div>
       <div className="w-full max-w-md">
         {/* Header */}
         <div className="text-center mb-6">
-          <div className="inline-flex items-center justify-center w-16 h-16 bg-primary-500 rounded-2xl mb-4">
+          <div className="inline-flex items-center justify-center w-16 h-16 bg-primary-500 rounded-2xl mb-4 shadow-lg shadow-primary-500/30">
             <ContainerIcon className="w-10 h-10 text-white" />
           </div>
-          <h1 className="text-3xl font-bold text-neutral-800">Docker 沙盒管理</h1>
-          <p className="text-neutral-600 mt-1">创建新账户</p>
+          <h1 className="text-3xl font-bold text-neutral-800 dark:text-neutral-100">Docker 沙盒管理</h1>
+          <p className="text-neutral-600 mt-1 dark:text-neutral-300">创建新账户</p>
         </div>
 
         {/* Register Card */}
@@ -76,7 +80,7 @@ const Register = () => {
           <form onSubmit={handleSubmit} className="space-y-4">
             {/* Error Message */}
             {error && (
-              <div className="flex items-start space-x-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+              <div className="flex items-start space-x-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm dark:bg-red-950/40 dark:border-red-900 dark:text-red-300">
                 <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
                 <span>{error}</span>
               </div>

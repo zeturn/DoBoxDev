@@ -184,7 +184,7 @@ const ImageList = () => {
       title: '镜像ID',
       dataIndex: 'id',
       render: (v: string) => (
-        <code className="text-xs bg-neutral-100 px-2 py-1 rounded">
+        <code className="text-xs bg-neutral-100 px-2 py-1 rounded dark:bg-neutral-800 dark:text-neutral-300">
           {v.replace('sha256:', '').slice(0, 12)}
         </code>
       ),
@@ -222,17 +222,17 @@ const ImageList = () => {
           <div className="flex gap-1">
             <button
               onClick={() => handleInspect(ref)}
-              className="p-2 hover:bg-neutral-100 rounded-lg transition-colors"
+              className="p-2 hover:bg-neutral-100 rounded-lg transition-colors dark:hover:bg-neutral-800"
               title="查看详情"
             >
-              <Eye className="w-4 h-4 text-neutral-600" />
+              <Eye className="w-4 h-4 text-neutral-600 dark:text-neutral-300" />
             </button>
             <button
               onClick={() => {
                 setImageToDelete(ref);
                 setDeleteModalOpen(true);
               }}
-              className="p-2 hover:bg-red-50 rounded-lg transition-colors"
+              className="p-2 hover:bg-red-50 rounded-lg transition-colors dark:hover:bg-red-950/40"
               title="删除"
             >
               <Trash2 className="w-4 h-4 text-red-600" />

@@ -20,14 +20,14 @@ export const FormItem: React.FC<FormItemProps> = ({
   return (
     <div className={`mb-4 ${className}`}>
       {label && (
-        <label className="block text-sm font-medium text-neutral-700 mb-2">
+        <label className="block text-sm font-medium text-neutral-700 mb-2 dark:text-neutral-200">
           {label}
           {required && <span className="text-red-500 ml-1">*</span>}
         </label>
       )}
       {children}
-      {extra && <p className="mt-1 text-xs text-neutral-500">{extra}</p>}
-      {error && <p className="mt-1 text-xs text-red-600">{error}</p>}
+      {extra && <p className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">{extra}</p>}
+      {error && <p className="mt-1 text-xs text-red-500 dark:text-red-400">{error}</p>}
     </div>
   );
 };
@@ -41,12 +41,12 @@ export const Input: React.FC<InputProps> = ({
   className = '',
   ...props
 }) => {
-  const baseClass = 'w-full px-4 py-2.5 border border-neutral-300 rounded-lg focus:border-primary-500 focus:outline-none focus:ring-2 focus:ring-primary-100 transition-all';
+  const baseClass = 'w-full px-4 py-2.5 border border-neutral-300 rounded-lg bg-white text-neutral-900 placeholder-neutral-400 focus:border-primary-500 focus:outline-none focus:ring-2 focus:ring-primary-100 transition-all dark:bg-neutral-900 dark:border-neutral-600 dark:text-neutral-100 dark:placeholder-neutral-500 dark:focus:ring-primary-900/40';
   
   if (prefix) {
     return (
       <div className="relative">
-        <div className="absolute left-3 top-1/2 transform -translate-y-1/2 text-neutral-400">
+        <div className="absolute left-3 top-1/2 transform -translate-y-1/2 text-neutral-400 dark:text-neutral-500">
           {prefix}
         </div>
         <input className={`${baseClass} pl-10 ${className}`} {...props} />
@@ -65,7 +65,7 @@ export const TextArea: React.FC<TextAreaProps> = ({
 }) => {
   return (
     <textarea
-      className={`w-full px-4 py-2.5 border border-neutral-300 rounded-lg focus:border-primary-500 focus:outline-none focus:ring-2 focus:ring-primary-100 transition-all resize-vertical ${className}`}
+      className={`w-full px-4 py-2.5 border border-neutral-300 rounded-lg bg-white text-neutral-900 placeholder-neutral-400 focus:border-primary-500 focus:outline-none focus:ring-2 focus:ring-primary-100 transition-all resize-vertical dark:bg-neutral-900 dark:border-neutral-600 dark:text-neutral-100 dark:placeholder-neutral-500 dark:focus:ring-primary-900/40 ${className}`}
       {...props}
     />
   );
@@ -83,7 +83,7 @@ export const Select: React.FC<SelectProps> = ({
 }) => {
   return (
     <select
-      className={`w-full px-4 py-2.5 border border-neutral-300 rounded-lg focus:border-primary-500 focus:outline-none focus:ring-2 focus:ring-primary-100 transition-all bg-white ${className}`}
+      className={`w-full px-4 py-2.5 border border-neutral-300 rounded-lg bg-white text-neutral-900 focus:border-primary-500 focus:outline-none focus:ring-2 focus:ring-primary-100 transition-all dark:bg-neutral-900 dark:border-neutral-600 dark:text-neutral-100 dark:focus:ring-primary-900/40 ${className}`}
       {...props}
     >
       {options.map((opt) => (
@@ -109,7 +109,7 @@ export const InputNumber: React.FC<InputNumberProps> = ({
   return (
     <input
       type="number"
-      className={`w-full px-4 py-2.5 border border-neutral-300 rounded-lg focus:border-primary-500 focus:outline-none focus:ring-2 focus:ring-primary-100 transition-all ${className}`}
+      className={`w-full px-4 py-2.5 border border-neutral-300 rounded-lg bg-white text-neutral-900 focus:border-primary-500 focus:outline-none focus:ring-2 focus:ring-primary-100 transition-all dark:bg-neutral-900 dark:border-neutral-600 dark:text-neutral-100 dark:focus:ring-primary-900/40 ${className}`}
       {...props}
     />
   );

@@ -79,7 +79,7 @@ const ContainerDetail = () => {
       <div className="flex items-center justify-center min-h-screen">
         <div className="text-center">
           <div className="inline-block w-12 h-12 border-4 border-primary-500 border-t-transparent rounded-full animate-spin"></div>
-          <p className="mt-4 text-neutral-600">加载中...</p>
+          <p className="mt-4 text-neutral-600 dark:text-neutral-400">加载中...</p>
         </div>
       </div>
     );
@@ -106,25 +106,25 @@ const ContainerDetail = () => {
       <Card title={`容器: ${container.name}`} extra={getStatusTag(container.status)}>
         <div className="grid grid-cols-2 gap-6">
           <div>
-            <p className="text-sm text-neutral-500 mb-1">容器ID</p>
-            <code className="text-sm bg-neutral-100 px-2 py-1 rounded">{container.container_id?.slice(0, 12)}</code>
+            <p className="text-sm text-neutral-500 mb-1 dark:text-neutral-400">容器ID</p>
+            <code className="text-sm bg-neutral-100 px-2 py-1 rounded dark:bg-neutral-800 dark:text-neutral-300">{container.container_id?.slice(0, 12)}</code>
           </div>
           <div>
-            <p className="text-sm text-neutral-500 mb-1">镜像</p>
+            <p className="text-sm text-neutral-500 mb-1 dark:text-neutral-400">镜像</p>
             <p className="text-sm font-medium">{container.image}</p>
           </div>
           <div>
-            <p className="text-sm text-neutral-500 mb-1">CPU限制</p>
+            <p className="text-sm text-neutral-500 mb-1 dark:text-neutral-400">CPU限制</p>
             <p className="text-sm">{container.cpu_limit > 0 ? `${container.cpu_limit} 核` : '无限制'}</p>
           </div>
           <div>
-            <p className="text-sm text-neutral-500 mb-1">内存限制</p>
+            <p className="text-sm text-neutral-500 mb-1 dark:text-neutral-400">内存限制</p>
             <p className="text-sm">
               {container.memory_limit > 0 ? `${(container.memory_limit / 1024 / 1024).toFixed(0)} MB` : '无限制'}
             </p>
           </div>
           <div className="col-span-2">
-            <p className="text-sm text-neutral-500 mb-1">创建时间</p>
+            <p className="text-sm text-neutral-500 mb-1 dark:text-neutral-400">创建时间</p>
             <p className="text-sm">{new Date(container.created_at).toLocaleString('zh-CN')}</p>
           </div>
         </div>

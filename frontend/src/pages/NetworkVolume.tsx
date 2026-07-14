@@ -101,7 +101,7 @@ const NetworkVolume = () => {
   };
 
   const networkColumns: Column<NetworkSummary>[] = [
-    { key: 'id', title: '网络ID', dataIndex: 'id', render: (v: string) => <code className="text-xs bg-neutral-100 px-2 py-1 rounded">{v.slice(0, 12)}</code> },
+    { key: 'id', title: '网络ID', dataIndex: 'id', render: (v: string) => <code className="text-xs bg-neutral-100 px-2 py-1 rounded dark:bg-neutral-800 dark:text-neutral-300">{v.slice(0, 12)}</code> },
     { key: 'name', title: '名称', dataIndex: 'name', render: (text: string) => <strong>{text}</strong> },
     { key: 'driver', title: '驱动', dataIndex: 'driver', render: (v: string) => <Tag color="blue">{v}</Tag> },
     { key: 'scope', title: '范围', dataIndex: 'scope' },
@@ -121,7 +121,7 @@ const NetworkVolume = () => {
   const volumeColumns: Column<VolumeSummary>[] = [
     { key: 'name', title: '名称', dataIndex: 'name', render: (text: string) => <strong>{text}</strong> },
     { key: 'driver', title: '驱动', dataIndex: 'driver', render: (v: string) => <Tag color="blue">{v}</Tag> },
-    { key: 'mountpoint', title: '挂载点', dataIndex: 'mountpoint', render: (v: string) => <code className="text-xs bg-neutral-100 px-2 py-1 rounded">{v}</code> },
+    { key: 'mountpoint', title: '挂载点', dataIndex: 'mountpoint', render: (v: string) => <code className="text-xs bg-neutral-100 px-2 py-1 rounded dark:bg-neutral-800 dark:text-neutral-300">{v}</code> },
     { key: 'created_at', title: '创建时间', dataIndex: 'created_at', render: (v: string) => formatDate(v) },
     {
       key: 'actions',

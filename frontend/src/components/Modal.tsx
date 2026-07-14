@@ -24,20 +24,20 @@ export const Modal: React.FC<ModalProps> = ({
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       {/* Backdrop */}
       <div
-        className="absolute inset-0 bg-black bg-opacity-40"
+        className="absolute inset-0 bg-black/40 backdrop-blur-sm dark:bg-black/60"
         onClick={onClose}
       />
 
       {/* Modal */}
-      <div className={`relative bg-white rounded-xl border border-neutral-200 w-full ${width} max-h-[90vh] overflow-hidden flex flex-col`}>
+      <div className={`relative bg-white rounded-xl border border-neutral-200 w-full shadow-2xl shadow-neutral-900/10 dark:bg-neutral-900 dark:border-neutral-700 dark:shadow-black/40 ${width} max-h-[90vh] overflow-hidden flex flex-col`}>
         {/* Header */}
-        <div className="flex items-center justify-between p-6 border-b border-neutral-200">
-          <h2 className="text-xl font-bold text-neutral-800">{title}</h2>
+        <div className="flex items-center justify-between p-6 border-b border-neutral-200 dark:border-neutral-700">
+          <h2 className="text-xl font-bold text-neutral-800 dark:text-neutral-100">{title}</h2>
           <button
             onClick={onClose}
-            className="p-1 hover:bg-neutral-100 rounded-lg transition-colors"
+            className="p-1 hover:bg-neutral-100 rounded-lg transition-colors dark:hover:bg-neutral-800"
           >
-            <X className="w-5 h-5 text-neutral-500" />
+            <X className="w-5 h-5 text-neutral-500 dark:text-neutral-400" />
           </button>
         </div>
 
@@ -48,7 +48,7 @@ export const Modal: React.FC<ModalProps> = ({
 
         {/* Footer */}
         {footer && (
-          <div className="p-6 border-t border-neutral-200 bg-neutral-50">
+          <div className="p-6 border-t border-neutral-200 bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-800/40">
             {footer}
           </div>
         )}
@@ -84,7 +84,7 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
         <div className="flex justify-end gap-3">
           <button
             onClick={onCancel}
-            className="px-4 py-2 border border-neutral-300 text-neutral-700 rounded-lg hover:bg-neutral-50 transition-colors font-medium"
+            className="px-4 py-2 border border-neutral-300 text-neutral-700 rounded-lg hover:bg-neutral-50 transition-colors font-medium dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
           >
             取消
           </button>
@@ -97,7 +97,7 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
         </div>
       }
     >
-      <p className="text-neutral-600">{message}</p>
+      <p className="text-neutral-600 dark:text-neutral-300">{message}</p>
     </Modal>
   );
 };

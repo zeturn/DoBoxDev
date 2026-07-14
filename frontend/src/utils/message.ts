@@ -24,10 +24,10 @@ class ToastManager {
     const toast = document.createElement('div');
     
     const colors = {
-      success: 'bg-green-50 border-green-500 text-green-800',
-      error: 'bg-red-50 border-red-500 text-red-800',
-      info: 'bg-blue-50 border-blue-500 text-blue-800',
-      warning: 'bg-yellow-50 border-yellow-500 text-yellow-800',
+      success: 'bg-green-50 border-green-500 text-green-800 dark:bg-green-500/15 dark:border-green-400 dark:text-green-300',
+      error: 'bg-red-50 border-red-500 text-red-800 dark:bg-red-500/15 dark:border-red-400 dark:text-red-300',
+      info: 'bg-blue-50 border-blue-500 text-blue-800 dark:bg-blue-500/15 dark:border-blue-400 dark:text-blue-300',
+      warning: 'bg-yellow-50 border-yellow-500 text-yellow-800 dark:bg-yellow-500/15 dark:border-yellow-400 dark:text-yellow-300',
     };
 
     const icons = {

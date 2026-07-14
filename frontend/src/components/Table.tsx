@@ -34,7 +34,7 @@ export const Table = <T extends Record<string, any>>({
       <div className="flex items-center justify-center py-12">
         <div className="flex flex-col items-center gap-3">
           <div className="w-10 h-10 border-4 border-primary-500 border-t-transparent rounded-full animate-spin"></div>
-          <p className="text-neutral-500">加载中...</p>
+          <p className="text-neutral-500 dark:text-neutral-400">加载中...</p>
         </div>
       </div>
     );
@@ -42,7 +42,7 @@ export const Table = <T extends Record<string, any>>({
 
   if (dataSource.length === 0) {
     return (
-      <div className="flex items-center justify-center py-12 text-neutral-500">
+      <div className="flex items-center justify-center py-12 text-neutral-500 dark:text-neutral-400">
         暂无数据
       </div>
     );
@@ -52,14 +52,14 @@ export const Table = <T extends Record<string, any>>({
 
   return (
     <div className="w-full">
-      <div className="overflow-x-auto border border-neutral-200 rounded-xl bg-white">
+      <div className="overflow-x-auto border border-neutral-200 rounded-xl bg-white dark:border-neutral-700 dark:bg-neutral-900">
         <table className="w-full">
-          <thead className="bg-neutral-50/80 border-b border-neutral-200">
+          <thead className="bg-neutral-50/80 border-b border-neutral-200 dark:bg-neutral-800/80 dark:border-neutral-700">
             <tr>
               {columns.map((col) => (
                 <th
                   key={col.key}
-                  className="px-4 py-3.5 text-left text-xs font-semibold text-neutral-500 uppercase tracking-wide"
+                  className="px-4 py-3.5 text-left text-xs font-semibold text-neutral-500 uppercase tracking-wide dark:text-neutral-400"
                   style={{ width: col.width }}
                 >
                   {col.title}
@@ -67,9 +67,9 @@ export const Table = <T extends Record<string, any>>({
               ))}
             </tr>
           </thead>
-          <tbody className="bg-white divide-y divide-neutral-200">
+          <tbody className="bg-white divide-y divide-neutral-200 dark:bg-neutral-900 dark:divide-neutral-700">
             {dataSource.map((record, index) => (
-              <tr key={record[rowKey]} className="hover:bg-primary-50/30 transition-colors">
+              <tr key={record[rowKey]} className="hover:bg-primary-50/30 transition-colors dark:hover:bg-primary-900/20">
                 {columns.map((col) => {
                   const value = col.dataIndex ? record[col.dataIndex] : undefined;
                   const content = col.render
@@ -77,7 +77,7 @@ export const Table = <T extends Record<string, any>>({
                     : value;
 
                   return (
-                    <td key={col.key} className="px-4 py-3.5 text-sm text-neutral-700 align-middle">
+                    <td key={col.key} className="px-4 py-3.5 text-sm text-neutral-700 align-middle dark:text-neutral-300">
                       {content}
                     </td>
                   );
@@ -90,24 +90,24 @@ export const Table = <T extends Record<string, any>>({
 
       {pagination && totalPages > 1 && (
         <div className="flex items-center justify-between mt-4 px-2">
-          <p className="text-sm text-neutral-600">
+          <p className="text-sm text-neutral-600 dark:text-neutral-400">
             共 {pagination.total} 条数据
           </p>
           <div className="flex items-center gap-2">
             <button
               onClick={() => pagination.onChange(pagination.current - 1)}
               disabled={pagination.current === 1}
-              className="p-2 rounded-lg border border-neutral-300 hover:bg-neutral-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              className="p-2 rounded-lg border border-neutral-300 hover:bg-neutral-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors dark:border-neutral-600 dark:hover:bg-neutral-800"
             >
               <ChevronLeft className="w-4 h-4" />
             </button>
-            <span className="text-sm text-neutral-600">
+            <span className="text-sm text-neutral-600 dark:text-neutral-400">
               {pagination.current} / {totalPages}
             </span>
             <button
               onClick={() => pagination.onChange(pagination.current + 1)}
               disabled={pagination.current === totalPages}
-              className="p-2 rounded-lg border border-neutral-300 hover:bg-neutral-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              className="p-2 rounded-lg border border-neutral-300 hover:bg-neutral-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors dark:border-neutral-600 dark:hover:bg-neutral-800"
             >
               <ChevronRight className="w-4 h-4" />
             </button>

@@ -211,7 +211,7 @@ const ContainerList = () => {
       key: 'name',
       title: '名称',
       dataIndex: 'name',
-      render: (text: string) => <strong className="text-neutral-800">{text}</strong>,
+      render: (text: string) => <strong className="text-neutral-800 dark:text-neutral-100">{text}</strong>,
     },
     {
       key: 'image',
