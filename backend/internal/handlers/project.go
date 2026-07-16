@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bufio"
 	"context"
 	"docode/internal/database"
 	"docode/internal/docker"
@@ -9,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"path"
 	"strconv"
 	"strings"
@@ -31,10 +33,19 @@ const (
 
 type ProjectHandler struct {
 	dockerService *docker.DockerService
+
+	// archiveDownload fetches the workspace tar stream. It is a field (not a
+	// direct dockerService call) so unit tests can substitute a fake stream
+	// without a live Docker daemon. Defaults to dockerService.DownloadFromContainer.
+	archiveDownload func(ctx context.Context, containerID, sourcePath string) (io.ReadCloser, error)
 }
 
 func NewProjectHandler(dockerService *docker.DockerService) *ProjectHandler {
-	return &ProjectHandler{dockerService: dockerService}
+	h := &ProjectHandler{dockerService: dockerService}
+	if dockerService != nil {
+		h.archiveDownload = dockerService.DownloadFromContainer
+	}
+	return h
 }
 
 type CreateProjectRequest struct {
@@ -731,16 +742,59 @@ func (h *ProjectHandler) ArchiveWorkspace(c *fiber.Ctx) error {
 		return nil
 	}
 
-	reader, err := h.dockerService.DownloadFromContainer(context.Background(), sandbox.ContainerID, sandbox.WorkspacePath)
-	h.recordToolCall(userID, project.ID, sessionID, "agent.archive", fiber.Map{"path": sandbox.WorkspacePath}, "", 0, err)
+	reader, err := h.archiveDownload(context.Background(), sandbox.ContainerID, sandbox.WorkspacePath)
 	if err != nil {
+		h.recordToolCall(userID, project.ID, sessionID, "agent.archive", fiber.Map{"path": sandbox.WorkspacePath}, "", 0, err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to archive workspace: " + err.Error()})
 	}
-	defer reader.Close()
 
 	c.Set("Content-Type", "application/x-tar")
 	c.Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"dobox-project-%d-workspace.tar\"", project.ID))
-	return c.SendStream(reader)
+
+	// Stream the Docker tar directly to the client. The reader must stay open
+	// until the copy completes: closing it in a deferred call races with
+	// fasthttp's lazy body write and truncates the stream (Case B — client
+	// sees RemoteProtocolError / "Server disconnected without sending a
+	// response"). The delivery outcome is audited only after the copy and
+	// close actually happen, so a disconnect is never recorded as success.
+	c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+		copied, copyErr := io.Copy(w, reader)
+		flushErr := w.Flush()
+		closeErr := reader.Close()
+
+		deliveryErr := copyErr
+		if deliveryErr == nil {
+			deliveryErr = flushErr
+		}
+		if deliveryErr == nil {
+			deliveryErr = closeErr
+		}
+		h.recordToolCall(
+			userID,
+			project.ID,
+			sessionID,
+			"agent.archive",
+			fiber.Map{
+				"path":         sandbox.WorkspacePath,
+				"project_id":   project.ID,
+				"session_id":   sessionID,
+				"bytes_copied": copied,
+				"copy_error":   errString(copyErr),
+				"flush_error":  errString(flushErr),
+				"close_error":  errString(closeErr),
+			},
+			"", 0, deliveryErr,
+		)
+	})
+
+	return nil
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func (h *ProjectHandler) cloneRepo(ctx context.Context, sandbox models.Sandbox, repoURL, branch string) (string, int, error) {
