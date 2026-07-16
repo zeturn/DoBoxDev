@@ -3,7 +3,9 @@ package handlers
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http/httptest"
 	"os"
@@ -683,4 +685,301 @@ func seedOwnedProjectSandbox(t *testing.T) {
 	if err := database.DB.Create(&sandbox).Error; err != nil {
 		t.Fatalf("failed to create sandbox: %v", err)
 	}
+}
+
+func TestArchiveWorkspaceStreamsValidTarWithoutLeakingContent(t *testing.T) {
+	setupProjectHandlerTestDB(t)
+	seedOwnedProjectSandbox(t)
+
+	archive := buildTar(t, map[string]string{
+		"cli.py":    "print('hello')\n",
+		"README.md": "notes\n",
+	})
+
+	handler := NewProjectHandler(nil)
+	handler.archiveDownload = func(ctx context.Context, containerID, sourcePath string) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(archive)), nil
+	}
+
+	app := fiber.New()
+	app.Use(func(c *fiber.Ctx) error { c.Locals("userID", uint(7)); return c.Next() })
+	app.Get("/projects/:projectId/artifacts/archive", handler.ArchiveWorkspace)
+
+	req := httptest.NewRequest("GET", "/projects/1/artifacts/archive", nil)
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("archive request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", fiber.StatusOK, resp.StatusCode, string(body))
+	}
+	if len(body) == 0 {
+		t.Fatal("expected non-empty archive body")
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/x-tar" {
+		t.Fatalf("expected Content-Type application/x-tar, got %q", ct)
+	}
+	assertTarContains(t, body, "cli.py", "README.md")
+
+	var calls []models.ToolCall
+	if err := database.DB.Where("tool_name = ?", "agent.archive").Order("id asc").Find(&calls).Error; err != nil {
+		t.Fatalf("failed to load tool calls: %v", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly 1 archive audit row, got %d", len(calls))
+	}
+	if calls[0].Status != "success" {
+		t.Fatalf("expected archive audit success, got %q (err=%q)", calls[0].Status, calls[0].Error)
+	}
+	if !strings.Contains(calls[0].Input, "/workspace") {
+		t.Fatalf("archive audit input should carry workspace path context: %s", calls[0].Input)
+	}
+	if strings.Contains(calls[0].Input, "print('hello')") {
+		t.Fatalf("archive audit must not leak file contents: %s", calls[0].Input)
+	}
+}
+
+func TestArchiveWorkspaceReaderClosedOnlyAfterCopy(t *testing.T) {
+	setupProjectHandlerTestDB(t)
+	seedOwnedProjectSandbox(t)
+
+	archive := buildTar(t, map[string]string{"a.txt": "data"})
+	tracker := &trackingReadCloser{inner: bytes.NewReader(archive)}
+
+	handler := NewProjectHandler(nil)
+	handler.archiveDownload = func(ctx context.Context, containerID, sourcePath string) (io.ReadCloser, error) {
+		return tracker, nil
+	}
+
+	app := fiber.New()
+	app.Use(func(c *fiber.Ctx) error { c.Locals("userID", uint(7)); return c.Next() })
+	app.Get("/projects/:projectId/artifacts/archive", handler.ArchiveWorkspace)
+
+	req := httptest.NewRequest("GET", "/projects/1/artifacts/archive", nil)
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("archive request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("expected status %d, got %d", fiber.StatusOK, resp.StatusCode)
+	}
+	if !tracker.closed {
+		t.Fatal("expected reader to be closed after streaming completes")
+	}
+	if len(body) != len(archive) {
+		t.Fatalf("expected full archive of %d bytes, got %d (reader may have been closed before copy)", len(archive), len(body))
+	}
+}
+
+func TestArchiveWorkspaceCopyFailureIsAuditedAsFailed(t *testing.T) {
+	setupProjectHandlerTestDB(t)
+	seedOwnedProjectSandbox(t)
+
+	failing := &errorAfterReadCloser{data: []byte("partial-tar-content"), failAfter: 4}
+
+	handler := NewProjectHandler(nil)
+	handler.archiveDownload = func(ctx context.Context, containerID, sourcePath string) (io.ReadCloser, error) {
+		return failing, nil
+	}
+
+	app := fiber.New()
+	app.Use(func(c *fiber.Ctx) error { c.Locals("userID", uint(7)); return c.Next() })
+	app.Get("/projects/:projectId/artifacts/archive", handler.ArchiveWorkspace)
+
+	req := httptest.NewRequest("GET", "/projects/1/artifacts/archive", nil)
+	resp, err := app.Test(req, -1)
+	if err == nil {
+		_ = resp.Body.Close()
+	}
+
+	var calls []models.ToolCall
+	if err := database.DB.Where("tool_name = ?", "agent.archive").Order("id asc").Find(&calls).Error; err != nil {
+		t.Fatalf("failed to load tool calls: %v", err)
+	}
+	// Exactly one row: the premature "success before delivery" bug would have
+	// written a success row earlier and a second failed row here.
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly 1 archive audit row, got %d", len(calls))
+	}
+	if calls[0].Status != "failed" {
+		t.Fatalf("copy failure must be audited as failed, got %q", calls[0].Status)
+	}
+	if calls[0].Error == "" {
+		t.Fatal("copy failure audit must record the copy error")
+	}
+}
+
+func TestArchiveWorkspaceDownloadErrorReturns500(t *testing.T) {
+	setupProjectHandlerTestDB(t)
+	seedOwnedProjectSandbox(t)
+
+	handler := NewProjectHandler(nil)
+	handler.archiveDownload = func(ctx context.Context, containerID, sourcePath string) (io.ReadCloser, error) {
+		return nil, fmt.Errorf("docker daemon unreachable")
+	}
+
+	app := fiber.New()
+	app.Use(func(c *fiber.Ctx) error { c.Locals("userID", uint(7)); return c.Next() })
+	app.Get("/projects/:projectId/artifacts/archive", handler.ArchiveWorkspace)
+
+	req := httptest.NewRequest("GET", "/projects/1/artifacts/archive", nil)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("archive request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusInternalServerError {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status %d, got %d: %s", fiber.StatusInternalServerError, resp.StatusCode, string(body))
+	}
+
+	var calls []models.ToolCall
+	if err := database.DB.Where("tool_name = ?", "agent.archive").Order("id asc").Find(&calls).Error; err != nil {
+		t.Fatalf("failed to load tool calls: %v", err)
+	}
+	if len(calls) != 1 || calls[0].Status != "failed" {
+		t.Fatalf("expected single failed audit row, got %#v", calls)
+	}
+	if !strings.Contains(calls[0].Error, "docker daemon unreachable") {
+		t.Fatalf("expected download error in audit, got %q", calls[0].Error)
+	}
+}
+
+func TestArchiveWorkspaceFiveConsecutiveDownloads(t *testing.T) {
+	if os.Getenv("DOBOX_RUN_DOCKER_INTEGRATION") != "1" {
+		t.Skip("set DOBOX_RUN_DOCKER_INTEGRATION=1 to run Docker archive integration test")
+	}
+	setupProjectHandlerTestDB(t)
+	dockerService, err := docker.NewDockerService()
+	if err != nil {
+		t.Skipf("docker unavailable: %v", err)
+	}
+	defer dockerService.Close()
+
+	app := fiber.New()
+	handler := NewProjectHandler(dockerService)
+	app.Use(func(c *fiber.Ctx) error { c.Locals("userID", uint(7)); return c.Next() })
+	app.Post("/projects", handler.CreateProject)
+	app.Delete("/projects/:projectId", handler.DeleteProject)
+	app.Post("/projects/:projectId/files/write", handler.WriteFile)
+	app.Get("/projects/:projectId/artifacts/archive", handler.ArchiveWorkspace)
+
+	createResp := doProjectJSONRequest(t, app, "POST", "/projects", map[string]any{"name": "archive-5x"})
+	if createResp.StatusCode != fiber.StatusCreated {
+		t.Fatalf("expected create status %d, got %d: %s", fiber.StatusCreated, createResp.StatusCode, createResp.Body)
+	}
+	projectID := intFromMap(t, createResp.JSON, "project", "id")
+	t.Cleanup(func() {
+		req := httptest.NewRequest("DELETE", "/projects/"+strconv.Itoa(projectID), nil)
+		resp, derr := app.Test(req, -1)
+		if derr == nil && resp != nil {
+			_ = resp.Body.Close()
+		}
+	})
+
+	writeResp := doProjectJSONRequest(t, app, "POST", "/projects/"+strconv.Itoa(projectID)+"/files/write", map[string]any{
+		"path":    "probe.txt",
+		"content": "probe-content\n",
+	})
+	if writeResp.StatusCode != fiber.StatusOK {
+		t.Fatalf("expected write status %d, got %d: %s", fiber.StatusOK, writeResp.StatusCode, writeResp.Body)
+	}
+
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest("GET", "/projects/"+strconv.Itoa(projectID)+"/artifacts/archive", nil)
+		resp, derr := app.Test(req, -1)
+		if derr != nil {
+			t.Fatalf("archive download %d failed: %v", i, derr)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != fiber.StatusOK {
+			t.Fatalf("archive download %d expected status %d, got %d", i, fiber.StatusOK, resp.StatusCode)
+		}
+		if len(body) == 0 {
+			t.Fatalf("archive download %d returned empty body", i)
+		}
+		assertTarContains(t, body, "probe.txt")
+	}
+}
+
+func buildTar(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for name, content := range files {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(content)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatalf("failed to write tar header: %v", err)
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			t.Fatalf("failed to write tar body: %v", err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("failed to close tar writer: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func assertTarContains(t *testing.T, body []byte, wantFiles ...string) {
+	t.Helper()
+	tr := tar.NewReader(bytes.NewReader(body))
+	found := map[string]bool{}
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("invalid tar stream: %v", err)
+		}
+		found[hdr.Name] = true
+	}
+	for _, f := range wantFiles {
+		if !found[f] {
+			t.Fatalf("archive tar missing expected file %q; found=%v", f, found)
+		}
+	}
+}
+
+type trackingReadCloser struct {
+	inner  *bytes.Reader
+	closed bool
+}
+
+func (t *trackingReadCloser) Read(p []byte) (int, error) {
+	if t.closed {
+		return 0, fmt.Errorf("read on already-closed reader")
+	}
+	return t.inner.Read(p)
+}
+
+func (t *trackingReadCloser) Close() error {
+	t.closed = true
+	return nil
+}
+
+type errorAfterReadCloser struct {
+	data      []byte
+	offset    int
+	failAfter int
+	closed    bool
+}
+
+func (e *errorAfterReadCloser) Read(p []byte) (int, error) {
+	if e.offset >= e.failAfter {
+		return 0, fmt.Errorf("simulated stream copy failure")
+	}
+	n := copy(p, e.data[e.offset:])
+	e.offset += n
+	return n, nil
+}
+
+func (e *errorAfterReadCloser) Close() error {
+	e.closed = true
+	return nil
 }
