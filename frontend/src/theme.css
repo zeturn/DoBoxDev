@@ -1,0 +1,46 @@
+/* Watercolor design language overrides — minimal, calm, few lines, few shadows, few motions. */
+html, body, #root { height: 100%; }
+body {
+  background: #fbfbfd;
+  color: #222222;
+  font-family: Inter, ui-sans-serif, system-ui, "Noto Sans SC", sans-serif;
+  background-image:
+    radial-gradient(60rem 60rem at 0% -10%, rgba(51,132,255,0.05), transparent 55%),
+    radial-gradient(50rem 50rem at 100% 0%, rgba(82,196,26,0.04), transparent 55%);
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3 { font-weight: 600; }
+
+/* Calm motion */
+*, *::before, *::after { transition-duration: 120ms; }
+
+/* Remove all box shadows; rely on background separation */
+*, *::before, *::after {
+  box-shadow: none !important;
+}
+
+/* Dim borders */
+.shadow, .shadow-sm, .shadow-md, .shadow-lg, .shadow-xl, .shadow-2xl {
+  box-shadow: none !important;
+}
+
+/* Remove spinner animations — keep only essential */
+.animate-spin {
+  animation-duration: 1800ms;
+}
+
+/* Slightly mute colors for calm feel */
+html body {
+  --color-primary-50: #f8faff;
+  --color-primary-100: #edf5ff;
+  --color-primary-200: #d7e9ff;
+  --color-primary-300: #b8d8ff;
+  --color-primary-400: #89bcff;
+  --color-primary-500: #5b9eff;
+  --color-primary-600: #3384ff;
+  --color-primary-700: #1f74f4;
+  --color-primary-800: #165fc5;
+  --color-primary-900: #164e9e;
+}
