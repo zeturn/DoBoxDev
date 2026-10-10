@@ -11,7 +11,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@zeturn/watercolor-react": "^1.1.46",
+    "@zeturn/watercolor-react": "^1.2.13",
     "axios": "^1.13.6",
     "lucide-react": "^1.49.0",
     "react": "^19.2.0",
