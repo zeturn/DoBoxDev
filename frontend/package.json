@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@zeturn/watercolor-react": "^1.1.46",
-    "axios": "^1.13.6",
+    "axios": "^1.20.0",
     "lucide-react": "^1.49.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.8",
